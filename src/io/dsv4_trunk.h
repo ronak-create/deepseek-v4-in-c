@@ -83,6 +83,14 @@ int  dsv4_trunk_open(DSV4Trunk *tr, const char *dir, const DSV4Cfg *c,
                      int64_t budget_bytes);
 void dsv4_trunk_close(DSV4Trunk *tr);
 
+/* How much RAM the trunk actually took. It self-limits: once every layer is
+ * pinned there is nothing left to put in a ring slot, so handing it a larger
+ * budget buys nothing. A caller splitting one budget between the trunk and the
+ * expert cache should therefore give the trunk what it asks for and hand the
+ * REMAINDER to the cache, rather than dividing by a fixed ratio -- see the note
+ * in dsv4_run.c. */
+int64_t dsv4_trunk_resident_bytes(const DSV4Trunk *tr);
+
 /* Make layer L resident and point b's weight pointers at it. */
 int  dsv4_trunk_bind(DSV4Trunk *tr, const DSV4Cfg *c, int L, DSV4LayerBind *b);
 

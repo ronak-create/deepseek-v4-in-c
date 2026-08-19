@@ -31,6 +31,8 @@
 #ifndef DSV4_CACHE_H
 #define DSV4_CACHE_H
 
+#include <stdio.h>
+
 #include "dsv4.h"
 #include "dsv4_st.h"
 #include "dsv4_bind.h"
@@ -68,6 +70,12 @@ typedef struct {
     unsigned char *bounce;
     int64_t        bounce_cap;
     int            direct;      /* 1 when the shards opened O_DIRECT */
+
+    /* Optional routing log: every (layer, expert) request in issue order, one
+     * per line. Purely diagnostic and off unless a path is given. Written for
+     * one reason -- the cache policy should be chosen from a measured access
+     * trace, not from an argument about what routing probably looks like. */
+    FILE *route_log;
 
     /* stats */
     uint64_t hits, misses, evictions;

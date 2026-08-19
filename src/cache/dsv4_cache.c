@@ -92,6 +92,33 @@ int dsv4_cache_init(DSV4Cache *c, const DSV4St *st, const DSV4Cfg *cfg,
                         "evicts more than it saves\n");
 
     c->nslot = (int)(budget_bytes / c->expert_bytes);
+
+    /* SAY SO WHEN THE CACHE CANNOT POSSIBLY WORK.
+     *
+     * One forward pass touches n_layers * topk experts, in a fixed cyclic order.
+     * Under LRU, a hit needs the entry to survive from one visit to a layer
+     * until the next -- and between those visits the engine loads every OTHER
+     * layer's experts. So if the cache holds fewer than a full pass's working
+     * set, each entry is guaranteed to be evicted before it is asked for again
+     * and the hit rate is exactly zero, no matter how skewed the routing is.
+     *
+     * This is not hypothetical. At the old fixed 1/4 budget split, Flash ran
+     * 160 slots against a 258-expert working set and returned 0 hits on 2,580
+     * requests while reading 32 GB. Silently useless memory is worse than no
+     * memory, so the engine now names the threshold it is under. */
+    const int64_t ws = (int64_t)cfg->n_layers * cfg->topk;
+    if ((int64_t)c->nslot < ws)
+        fprintf(stderr,
+                "dsv4_cache: %d slots (%.2f GB) is below one forward pass's "
+                "working set of\n"
+                "  %lld experts (%.2f GB). LRU cannot hit at this size -- every "
+                "entry is evicted\n"
+                "  before its layer comes round again. Raise --budget to at "
+                "least %.1f GB.\n",
+                c->nslot, (double)budget_bytes / 1073741824.0,
+                (long long)ws, (double)(ws * c->expert_bytes) / 1073741824.0,
+                (double)(ws * c->expert_bytes) / 1073741824.0);
+
     c->slot = (DSV4Slot *)calloc((size_t)c->nslot, sizeof(DSV4Slot));
     if (!c->slot) return -1;
 
@@ -236,6 +263,7 @@ static int load_expert(DSV4Cache *c, DSV4Slot *s, const DSV4Tensor *t[6])
 const DSV4ExpertW *dsv4_cache_get(DSV4Cache *c, int layer, int expert)
 {
     c->clock++;
+    if (c->route_log) fprintf(c->route_log, "%d %d\n", layer, expert);
 
     for (int i = 0; i < c->nslot; i++) {
         if (c->slot[i].layer == layer && c->slot[i].expert == expert) {

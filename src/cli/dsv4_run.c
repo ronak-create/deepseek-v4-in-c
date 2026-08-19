@@ -88,12 +88,13 @@ static void hc_head(float *y, const float *x, const DSV4HcW *w,
 static void usage(const char *me)
 {
     printf("usage: %s <model_dir> --trunk <dir> --tok <file> "
-           "[--prompt TEXT] [--gen N] [--budget GB]\n", me);
+           "[--prompt TEXT] [--gen N] [--budget GB] [--route-log FILE]\n", me);
 }
 
 int main(int argc, char **argv)
 {
     const char *model = NULL, *trunkdir = NULL, *tokfile = NULL;
+    const char *routelog = NULL;
     const char *prompt = "The capital of France is";
     int ngen = 8;
     double budget_gb = 8.0;
@@ -105,6 +106,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--prompt")&& i + 1 < argc) prompt  = argv[++i];
         else if (!strcmp(argv[i], "--gen")   && i + 1 < argc) ngen    = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--budget")&& i + 1 < argc) budget_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--route-log") && i + 1 < argc) routelog = argv[++i];
         else if (!strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
     }
     if (!model || !trunkdir || !tokfile) { usage(argv[0]); return 2; }
@@ -127,13 +129,27 @@ int main(int argc, char **argv)
     }
 
     const int64_t budget = (int64_t)(budget_gb * 1073741824.0);
-    /* Split the budget: the trunk gets the larger share because a pinned layer
-     * is a guaranteed hit, while an expert slot only helps if that expert is
-     * routed to again. */
+    /* SPLIT THE BUDGET BY WHAT EACH PART CAN USE, NOT BY A FIXED RATIO.
+     *
+     * This used to hand the trunk 3/4 and the cache 1/4, reasoning that a
+     * pinned layer is a guaranteed hit while an expert slot only pays off on a
+     * re-route. True as far as it goes, and it produced a cache that could not
+     * work: the trunk SATURATES. Once all 43 layers are pinned there is nothing
+     * left to put in a ring slot, so trunk budget beyond ~6.4 GB buys exactly
+     * nothing -- while the expert cache was held at 1/4 of 8 GB = 2.0 GB, below
+     * the 3.29 GB one forward pass touches. A measured run: 2,580 expert
+     * requests, ZERO hits.
+     *
+     * So: let the trunk take what it can use, and give the cache the rest. */
     DSV4Trunk tr;
-    if (dsv4_trunk_open(&tr, trunkdir, &c, budget * 3 / 4) != 0) return 1;
+    if (dsv4_trunk_open(&tr, trunkdir, &c, budget) != 0) return 1;
+    int64_t left = budget - dsv4_trunk_resident_bytes(&tr);
     DSV4Cache cache;
-    if (dsv4_cache_init(&cache, &st, &c, budget / 4) != 0) return 1;
+    if (dsv4_cache_init(&cache, &st, &c, left) != 0) return 1;
+    if (routelog) {
+        cache.route_log = fopen(routelog, "w");
+        if (!cache.route_log) { perror(routelog); return 1; }
+    }
 
     DSV4ModelBind mb;
     if (dsv4_bind_model(&st, &c, 1, &mb) != 0) return 1;

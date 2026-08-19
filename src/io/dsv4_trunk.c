@@ -180,6 +180,13 @@ int dsv4_trunk_open(DSV4Trunk *tr, const char *dir, const DSV4Cfg *c,
     return 0;
 }
 
+int64_t dsv4_trunk_resident_bytes(const DSV4Trunk *tr)
+{
+    int64_t n = (int64_t)tr->nslot * tr->slot_bytes + (int64_t)tr->widen_cap;
+    for (int i = 0; i < tr->npin; i++) n += tr->lay[i].nbytes;
+    return n;
+}
+
 void dsv4_trunk_close(DSV4Trunk *tr)
 {
     if (!tr) return;
