@@ -297,3 +297,112 @@ def block_dense(h, W, cfg, kv_cache, fc, pos, token_id):
     x = rmsnorm(x, W["ffn_norm"], ne)
     x = moe_dense(x, W, cfg, token_id)
     return hc_post(x, residual, post, comb, hc)
+
+
+# ======================================================= compressed block ====
+# model.py Compressor.forward, start_pos > 0 branch, plus the ratio != 0
+# attention path. Written from that branch; a token-at-a-time loop starting at
+# position 0 agrees with the seqlen==1 prefill branch, because there
+# should_compress is `seqlen >= ratio` (false for one token) and the state write
+# lands in the same slot.
+
+class CompressorState:
+    """The compressor's open window. score_state starts at -inf so an unfilled
+    slot contributes nothing to the pooling softmax; zeros would give it uniform
+    weight instead."""
+
+    def __init__(self, ratio, head_dim):
+        self.ratio = ratio
+        self.overlap = (ratio == 4)
+        self.coff = 1 + self.overlap
+        w = self.coff * head_dim
+        n = self.coff * ratio
+        self.kv = torch.zeros(n, w)
+        self.score = torch.full((n, w), float("-inf"))
+        self.d = head_dim
+
+
+def compress_step(cs, kv, score, ape, pos):
+    """One decode step. Returns the pooled row, or None while the window is open."""
+    r, d, ov = cs.ratio, cs.d, cs.overlap
+    phase = pos % r
+    score = score + ape[phase]
+
+    slot = (r + phase) if ov else phase
+    cs.kv[slot] = kv
+    cs.score[slot] = score
+
+    if (pos + 1) % r != 0:
+        return None
+
+    if ov:
+        # first `ratio` slots contribute their FIRST d channels (the previous
+        # window), the next `ratio` their SECOND d (the current one)
+        k_sel = torch.cat([cs.kv[:r, :d], cs.kv[r:, d:]], dim=0)
+        s_sel = torch.cat([cs.score[:r, :d], cs.score[r:, d:]], dim=0)
+        out = (k_sel * s_sel.softmax(dim=0)).sum(dim=0)
+        cs.kv[:r] = cs.kv[r:].clone()
+        cs.score[:r] = cs.score[r:].clone()
+    else:
+        out = (cs.kv * cs.score.softmax(dim=0)).sum(dim=0)
+    return out
+
+
+def attention_compressed(x, W, cfg, cache, cs, fc, pos, n_comp):
+    """compress_ratio != 0 attention. `cache` is window-first, compressed-after."""
+    hd, rd, H = cfg["head_dim"], cfg["qk_rope"], cfg["n_heads"]
+    eps, win, ratio = cfg["rms_eps"], cfg["window"], cfg["ratio"]
+
+    qr = rmsnorm(x @ W["wq_a"].T.float(), W["q_norm"], eps)
+    q = (qr @ W["wq_b"].T.float()).reshape(H, hd)
+    q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+    q = torch.cat([q[:, :hd - rd], apply_rope(q[:, hd - rd:], fc[pos])], dim=-1)
+
+    kv = rmsnorm(x @ W["wkv"].T.float(), W["kv_norm"], eps)
+    kv = torch.cat([kv[:hd - rd], apply_rope(kv[hd - rd:], fc[pos])], dim=-1)
+    cache[pos % win] = kv
+
+    # the compressor sees the same normed x attention does
+    ck = x @ W["c_wkv"].T.float()
+    csc = x @ W["c_wgate"].T.float()
+    pooled = compress_step(cs, ck, csc, W["c_ape"], pos)
+    if pooled is not None:
+        pooled = rmsnorm(pooled, W["c_norm"], eps)
+        # stamped with the FIRST position of the window it summarises
+        pooled = torch.cat([pooled[:hd - rd],
+                            apply_rope(pooled[hd - rd:], fc[pos + 1 - ratio])], dim=-1)
+        cache[win + n_comp[0]] = pooled
+        n_comp[0] += 1
+
+    n = min(pos + 1, win)
+    idxs = [(pos - k) % win for k in range(n)] + [-1] * (win - n)
+    idxs += [win + i for i in range(n_comp[0])]
+    o = sparse_attn(q, cache, W["sink"], torch.tensor(idxs, dtype=torch.long),
+                    hd ** -0.5)
+
+    o = torch.cat([o[:, :hd - rd],
+                   apply_rope(o[:, hd - rd:], fc[pos], inverse=True)], dim=-1)
+    g, gr = cfg["o_groups"], cfg["o_lora"]
+    gw = H * hd // g
+    wo_a = W["wo_a"].float().reshape(g, gr, gw)
+    o = torch.einsum("gd,grd->gr", o.reshape(g, gw), wo_a).reshape(-1)
+    return o @ W["wo_b"].T.float()
+
+
+def block_compressed(h, W, cfg, cache, cs, fc, pos, token_id, n_comp):
+    hc = cfg["hc_mult"]
+    it, ne, he = cfg["sinkhorn_iters"], cfg["rms_eps"], cfg["hc_eps"]
+
+    residual = h
+    x, post, comb = hc_pre(h, W["hc_attn_fn"].float(), W["hc_attn_scale"],
+                           W["hc_attn_base"], hc, ne, he, it)
+    x = rmsnorm(x, W["attn_norm"], ne)
+    x = attention_compressed(x, W, cfg, cache, cs, fc, pos, n_comp)
+    h = hc_post(x, residual, post, comb, hc)
+
+    residual = h
+    x, post, comb = hc_pre(h, W["hc_ffn_fn"].float(), W["hc_ffn_scale"],
+                           W["hc_ffn_base"], hc, ne, he, it)
+    x = rmsnorm(x, W["ffn_norm"], ne)
+    x = moe_dense(x, W, cfg, token_id)
+    return hc_post(x, residual, post, comb, hc)

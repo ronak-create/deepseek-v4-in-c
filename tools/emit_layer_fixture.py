@@ -127,6 +127,8 @@ def main():
     J["h_in"] = [float(v) for v in h.flatten().tolist()]
 
     steps, token_id = 6, 3
+    # long enough that several windows CLOSE and the overlap slide runs
+    steps_c = 20
     J["steps"] = steps
     J["token_id"] = token_id
     outs = []
@@ -139,6 +141,52 @@ def main():
     p.write_text(json.dumps(J) + "\n")
     print(f"  {p}  ({steps} steps, hidden={d}, hc={hc}, "
           f"{c['n_experts']} experts top{c['topk']})")
+
+    # ---- the compressed variants -------------------------------------------
+    # Identical weights plus a compressor, so any difference between these and
+    # layer_dense is the compressor and not a different model.
+    #
+    # ratio 8 stands in for the released 128: the code branches on `ratio == 4`
+    # for the overlap path and treats every other value identically, so 8
+    # exercises the same branch at a size a fixture can hold. ratio 4 then adds
+    # the overlap splice and the window slide.
+    for tag, ratio in (("c8", 8), ("c4", 4)):
+        cc = dict(c)
+        cc["ratio"] = ratio
+        coff = 2 if ratio == 4 else 1
+        W2, J2 = dict(W), dict(J)
+        J2["cfg"] = cc
+
+        for key, shape, isbf, sc in (
+                ("c_wkv",   (coff * hd, d),        True,  0.05),
+                ("c_wgate", (coff * hd, d),        True,  0.05),
+                ("c_ape",   (ratio, coff * hd),    False, 0.5),
+                ("c_norm",  (hd,),                 False, 0.2)):
+            if isbf:
+                t, v = bf16(*shape, scale=sc)
+            else:
+                t, v = f32(*shape, scale=sc)
+            W2[key], J2[key] = t, v
+        W2["c_norm"] = W2["c_norm"] + 1.0
+        J2["c_norm"] = [float(v) for v in W2["c_norm"].tolist()]
+
+        st = R.CompressorState(ratio, hd)
+        cache = torch.zeros(cc["window"] + steps_c // ratio + 2, hd)
+        n_comp = [0]
+        h2 = torch.tensor(J["h_in"]).reshape(hc, d).clone()
+        outs2 = []
+        for pos in range(steps_c):
+            h2 = R.block_compressed(h2, W2, cc, cache, st, fc, pos,
+                                    token_id, n_comp)
+            outs2.append([float(v) for v in h2.flatten().tolist()])
+        J2["steps"] = steps_c
+        J2["h_out"] = outs2
+        J2["n_compressed"] = n_comp[0]
+
+        q = out / f"layer_{tag}.json"
+        q.write_text(json.dumps(J2) + "\n")
+        print(f"  {q}  (ratio {ratio}, {steps_c} steps, "
+              f"{n_comp[0]} compressed rows)")
 
 
 if __name__ == "__main__":

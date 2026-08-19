@@ -92,12 +92,13 @@ static const DSV4ExpertW *get_expert(void *ctx, int layer, int e)
     return &g_ex[e];
 }
 
-int main(void)
+static int run_case(const char *file, const char *label)
 {
-    printf("DeepSeek-V4 WHOLE-BLOCK oracle gate\n");
+    printf("\n== %s ==\n", label);
 
-    char *txt = slurp("tests/fixtures/ref/layer_dense.json");
-    if (!txt) { printf("  FAIL  fixture missing; run make ref-fixtures\n"); return 1; }
+    char *txt = slurp(file);
+    if (!txt) { printf("  FAIL  %s missing; run make ref-fixtures\n", file);
+                fails++; return 1; }
     char *arena = NULL;
     G = json_parse(txt, &arena);
     if (!G) { printf("  FAIL  fixture is not valid JSON\n"); return 1; }
@@ -125,12 +126,29 @@ int main(void)
     c.hc_sinkhorn_iters = (int)cnum(jc, "sinkhorn_iters");
     c.n_layers    = 1;
     c.num_hash_layers = 0;                 /* scored routing */
+    c.index_n_heads  = (int)cnum(jc, "n_heads");
+    c.index_head_dim = (int)cnum(jc, "head_dim");
+    c.index_topk     = 1 << 20;            /* take every compressed row */
+
+    /* compress_ratio comes from the fixture. The layer map is one entry long
+     * because the fixture is one layer. */
+    static int cr[1];
+    cr[0] = (int)cnum(jc, "ratio");
+    c.n_compress = 1;
+    c.compress_ratios = cr;
 
     const int hc = c.hc_mult, d = c.hidden, H = c.n_heads, hd = c.head_dim;
     const int mix = (2 + hc) * hc;
 
     DSV4LayerW w; memset(&w, 0, sizeof w);
-    w.layer = 0; w.compress_ratio = 0; w.hash_routed = 0;
+    w.layer = 0; w.hash_routed = 0;
+    w.compress_ratio = cr[0];
+    w.has_comp = (cr[0] != 0);
+    w.has_idx  = 0;   /* the indexer is exercised separately; here every
+                       * compressed row is taken, which is what index_topk
+                       * above forces and what the reference does */
+    w.attn.has_comp = w.has_comp;
+    w.attn.has_idx  = 0;
 
     static float attn_norm[512], ffn_norm[512], q_norm[512], kv_norm[512], sink[64];
     static float hcaf[8192], hcff[8192], hcab[64], hcfb[64], hcas[8], hcfs[8];
@@ -154,6 +172,19 @@ int main(void)
     mk(&w.attn.wo_b, "wo_b", d, c.o_groups * c.o_lora);
     mk(&w.moe.gate,  "gate", c.n_experts, d);
 
+    static float c_ape[4096], c_norm[512];
+    if (w.has_comp) {
+        const int coff = (cr[0] == 4) ? 2 : 1;
+        mk(&w.attn.comp.wkv,   "c_wkv",   coff * hd, d);
+        mk(&w.attn.comp.wgate, "c_wgate", coff * hd, d);
+        nf("c_ape", c_ape, 4096);
+        nf("c_norm", c_norm, 512);
+        w.attn.comp.ape  = c_ape;
+        w.attn.comp.norm = c_norm;
+        w.attn.comp.ratio = cr[0];
+        w.attn.comp.coff  = coff;
+    }
+
     static float gbias[256];
     nf("gate_bias", gbias, 256);
     w.moe.bias = gbias;
@@ -169,21 +200,24 @@ int main(void)
     mk(&w.moe.shared.w3, "sh_w3", c.moe_inter, d);
     mk(&w.moe.shared.w2, "sh_w2", d, c.moe_inter);
 
-    /* Dense layer: YaRN disabled, theta 10000. */
-    static float cs[64 * 64], sn[64 * 64];
-    dsv4_rope_table(cs, sn, c.qk_rope, 64, 0, 10000.0, 16.0, 32.0, 1.0);
+    /* The fixture's reference uses one table for both kinds, so match it. In
+     * the real model a ratio-0 layer uses theta 10000 with YaRN off and every
+     * compressed layer theta 160000 with YaRN on -- that split is covered by
+     * the rope gate, not here. */
+    static float cs[128 * 64], sn[128 * 64];
+    dsv4_rope_table(cs, sn, c.qk_rope, 128, 0, 10000.0, 16.0, 32.0, 1.0);
 
     DSV4Scratch s;
     if (dsv4_scratch_init(&s, &c) != 0) { printf("  FAIL  scratch\n"); return 1; }
     DSV4ExpertSrc src = { get_expert, NULL };
 
-    static float h[512];
+    static float h[1024];
     DSV4LayerState lstate;
-    if (dsv4_state_init(&lstate, &c, 0, 64) != 0) {
+    if (dsv4_state_init(&lstate, &c, 0, 128) != 0) {
         printf("  FAIL  layer state allocation\n");
         return 1;
     }
-    nf("h_in", h, 512);
+    nf("h_in", h, 1024);
     const int steps = (int)cnum(G, "steps");
     const int token_id = (int)cnum(G, "token_id");
     jval *outs = json_get(G, "h_out");
@@ -220,8 +254,39 @@ int main(void)
                    pos, (double)worst, hc * d);
     }
 
+    /* The compressor must close the same number of windows as the reference.
+     * A row emitted on the wrong step, or one missed at the boundary, changes
+     * how much history attention can see without changing any single value. */
+    if (w.has_comp) {
+        const int want = (int)cnum(G, "n_compressed");
+        CHECK(lstate.n_compressed == want,
+              "produced %d compressed rows, reference produced %d",
+              lstate.n_compressed, want);
+        if (lstate.n_compressed == want)
+            printf("  ok    %d compressed rows, matching the reference\n", want);
+    }
+
     dsv4_state_free(&lstate);
     dsv4_scratch_free(&s);
+    free(txt);
+    return 0;
+}
+
+int main(void)
+{
+    printf("DeepSeek-V4 WHOLE-BLOCK oracle gate\n");
+
+    /* All three layer kinds through one code path. The overlap case is the one
+     * worth having: it splices the previous window's first half-channels with
+     * the current window's second half, then slides. Nothing smaller catches a
+     * mistake in that. */
+    run_case("tests/fixtures/ref/layer_dense.json",
+             "compress_ratio 0  (dense, no compressor)");
+    run_case("tests/fixtures/ref/layer_c8.json",
+             "compress_ratio 8  (HCA, non-overlap)");
+    run_case("tests/fixtures/ref/layer_c4.json",
+             "compress_ratio 4  (HCA, OVERLAP: two half-windows spliced)");
+
     printf("\n");
     if (fails) { printf("BLOCK ORACLE GATE FAILED: %d check(s)\n", fails); return 1; }
     printf("BLOCK ORACLE GATE PASSED\n");
