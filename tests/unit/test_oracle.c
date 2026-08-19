@@ -245,7 +245,7 @@ int main(void)
         arr(f, "q", g_a, BUF); arr(f, "kv", g_b, BUF); arr(f, "sink", g_c, BUF);
         static int idxs[64]; iarr(f, "idxs", idxs, 64);
         arr(f, "o", g_r, BUF);
-        static float scratch[256];
+        static float scratch[4096];
         dsv4_sparse_attn(g_o, g_a, g_b, g_c, idxs, h, d, tk,
                          (float)num(f, "scale", 1.0), scratch);
         agree("sparse_attn", g_o, g_r, h * d, 2e-5f);

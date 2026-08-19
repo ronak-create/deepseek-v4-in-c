@@ -137,7 +137,7 @@ int dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c)
         + (size_t)c->o_groups * (size_t)c->o_lora   /* ogrp */
         + (size_t)c->n_experts * 2                  /* gate scores + orig  */
         + inter * 3                                 /* expert gate/up/out  */
-        + nidx                                      /* attention scratch   */
+        + (size_t)c->n_heads * nidx                 /* attn scratch, PER HEAD */
         + d                                         /* expert_acc          */
         + 4u * (size_t)c->head_dim                  /* comp kv/score in    */
         + (size_t)c->index_n_heads * (size_t)c->index_head_dim  /* idx q  */

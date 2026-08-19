@@ -23,7 +23,7 @@ int main(void)
         /* q = 0 makes every score 0, so with a very negative sink the softmax is
          * uniform over the gathered positions and the output is their mean. */
         enum { H = 2, D = 4, N = 4, TOPK = 4 };
-        float q[H * D] = {0}, kv[N * D], o[H * D], scratch[TOPK];
+        float q[H * D] = {0}, kv[N * D], o[H * D], scratch[H * TOPK];
         float sink[H] = { -1000.0f, -1000.0f };
         int idxs[TOPK] = { 0, 1, 2, 3 };
         for (int n = 0; n < N; n++)
@@ -47,7 +47,7 @@ int main(void)
         float q[H * D] = { 0.0f, 0.0f };
         float kv[D] = { 8.0f, 8.0f };
         float sink[H] = { 0.0f };
-        float o[H * D], scratch[TOPK];
+        float o[H * D], scratch[H * TOPK];
         int idxs[TOPK] = { 0 };
 
         dsv4_sparse_attn(o, q, kv, sink, idxs, H, D, TOPK, 1.0f, scratch);
@@ -65,7 +65,7 @@ int main(void)
         enum { H = 1, D = 2, TOPK = 1 };
         float q[H * D] = { 0.0f, 0.0f };
         float kv[D] = { 8.0f, 8.0f };
-        float o[H * D], scratch[TOPK];
+        float o[H * D], scratch[H * TOPK];
         int idxs[TOPK] = { 0 };
         float small[H] = { -20.0f }, large[H] = { 20.0f };
 
@@ -89,7 +89,7 @@ int main(void)
         float q[H * D] = {0};
         float kv[D] = { 8.0f, 8.0f };
         float sink[H] = { -20.0f, 20.0f };
-        float o[H * D], scratch[TOPK];
+        float o[H * D], scratch[H * TOPK];
         int idxs[TOPK] = { 0 };
         dsv4_sparse_attn(o, q, kv, sink, idxs, H, D, TOPK, 1.0f, scratch);
         CHECK(fabsf(o[0] - 8.0f) < 1e-3f, "head 0 = %.6f, expected ~8", (double)o[0]);
@@ -103,7 +103,7 @@ int main(void)
         /* Four slots, two masked. The answer must equal the mean of the two
          * live values, not of all four, and must not read kv[-1]. */
         enum { H = 1, D = 2, N = 4, TOPK = 4 };
-        float q[H * D] = {0}, kv[N * D], o[H * D], scratch[TOPK];
+        float q[H * D] = {0}, kv[N * D], o[H * D], scratch[H * TOPK];
         float sink[H] = { -1000.0f };
         int idxs[TOPK] = { 0, -1, 2, -1 };
         for (int n = 0; n < N; n++)
@@ -122,7 +122,7 @@ int main(void)
         enum { H = 1, D = 2, N = 3, TOPK = 3 };
         float q[H * D] = { 0.0f, 10.0f };
         float kv[N * D] = { 1.0f, 0.0f,   0.0f, 1.0f,   -1.0f, 0.0f };
-        float o[H * D], scratch[TOPK];
+        float o[H * D], scratch[H * TOPK];
         float sink[H] = { -1000.0f };
         int idxs[TOPK] = { 0, 1, 2 };
         dsv4_sparse_attn(o, q, kv, sink, idxs, H, D, TOPK, 1.0f, scratch);

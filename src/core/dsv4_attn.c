@@ -44,13 +44,28 @@
 /* o and q are [h][d]; kv is [n][d] and is addressed through idxs.
  * idxs holds `topk` entries, each an index into kv or -1 for "masked".
  * sink holds one float per query head. */
+/* PARALLEL OVER HEADS, and that is safe in the strong sense.
+ *
+ * Each head reads the same q/kv and writes its own row of o, and the reduction
+ * ORDER INSIDE a head is untouched -- the loops below run in the same sequence
+ * whatever thread executes them. So the output is bit-identical to the serial
+ * version, which is the contract the whole engine is arranged around: a
+ * performance change must never become an accuracy change.
+ *
+ * It was worth doing because this was the largest single-threaded loop left.
+ * Measured: ~180M double-precision fma per token across 43 layers, running on
+ * one core while nineteen idled.
+ *
+ * `scratch` becomes per-head rather than shared, since heads now run at once. */
 void dsv4_sparse_attn(float *o, const float *q, const float *kv,
                       const float *sink, const int *idxs,
                       int h, int d, int topk, float scale, float *scratch)
 {
-    float *s = scratch;                    /* topk scores for the current head */
-
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (h > 4)
+#endif
     for (int i = 0; i < h; i++) {
+        float *s = scratch + (size_t)i * topk;
         const float *qi = q + (size_t)i * d;
 
         /* Scores, and the max over the VALID ones only. */
