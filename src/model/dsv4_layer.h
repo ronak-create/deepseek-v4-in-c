@@ -70,6 +70,26 @@ void dsv4_state_free(DSV4LayerState *st);
  * table: model.py builds freqs_cis with compress_rope_theta and YaRN enabled for
  * any compress_ratio != 0, and with rope_theta and YaRN disabled for ratio 0.
  * The compressor rotates with the same table as the layer it belongs to. */
+/* WHERE THE TIME GOES, split so the CPU/GPU question can be answered with data.
+ *
+ * The distinction that matters is expert_io vs expert_mm. A streamed MoE reads
+ * routed experts off NVMe and then multiplies by them; those two costs live in
+ * the same loop but have opposite remedies. Only expert_mm can move to a GPU --
+ * expert_io is a disk read, and putting it behind PCIe would make it worse.
+ *
+ * Seconds, accumulated across the whole run. Always on: a handful of
+ * clock_gettime calls per layer is nothing beside a 12.75 MB read. */
+typedef struct {
+    double hc;          /* mHC pre/post, Sinkhorn, the two RMSNorms   */
+    double attn;        /* CSA + HCA + RoPE + the output projection   */
+    double gate;        /* router matmul and top-k selection          */
+    double expert_io;   /* waiting for the expert cache               */
+    double expert_mm;   /* routed-expert FP4 matmuls                  */
+    double shared;      /* the shared expert                          */
+} DSV4Prof;
+extern DSV4Prof dsv4_prof;
+void dsv4_prof_report(double wall, int passes);
+
 void dsv4_layer_forward(float *h, const DSV4LayerW *w, const DSV4Cfg *c,
                         DSV4Scratch *s, const DSV4ExpertSrc *src,
                         DSV4LayerState *st, const float *cs, const float *sn,

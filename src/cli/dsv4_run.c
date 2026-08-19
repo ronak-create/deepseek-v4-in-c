@@ -227,6 +227,7 @@ int main(int argc, char **argv)
            ntok ? dt / ntok : 0.0);
     dsv4_trunk_report(&tr, "run");
     dsv4_cache_report(&cache, "run");
+    dsv4_prof_report(dt, ntok);
     printf("PEAK RSS for the whole run: %.2f GB\n", peak_rss_gb());
 
     for (int L = 0; L < c.n_layers; L++) dsv4_state_free(&lst[L]);

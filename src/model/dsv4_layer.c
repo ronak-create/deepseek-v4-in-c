@@ -37,6 +37,8 @@
  *    right shapes and mixes heads that must stay in separate groups.
  */
 #include <math.h>
+#include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -321,14 +323,46 @@ static void attention(float *out, const float *x, const DSV4LayerW *w,
 }
 
 /* MoE for one token. `token_id` is only read on hash-routed layers. */
+DSV4Prof dsv4_prof;
+
+static double pnow(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec;
+}
+
+void dsv4_prof_report(double wall, int passes)
+{
+    const DSV4Prof *p = &dsv4_prof;
+    const double acc = p->hc + p->attn + p->gate + p->expert_io
+                     + p->expert_mm + p->shared;
+    printf("where the time went: %.1f s of %.1f s wall (%.0f%% accounted)\n",
+           acc, wall, 100.0 * acc / wall);
+    const struct { const char *n; double v; const char *note; } row[] = {
+        { "routed experts (matmul)", p->expert_mm, "FP4, CPU-bound"     },
+        { "routed experts (disk)",   p->expert_io, "NVMe, cannot move"  },
+        { "attention",               p->attn,      "CSA/HCA/RoPE"       },
+        { "mHC + norms",             p->hc,        "Sinkhorn"           },
+        { "shared expert",           p->shared,    "FP8"                },
+        { "router",                  p->gate,      ""                   },
+    };
+    for (unsigned i = 0; i < sizeof row / sizeof row[0]; i++)
+        printf("  %-24s %7.1f s  %5.1f%%  %6.1f ms/pass  %s\n",
+               row[i].n, row[i].v, 100.0 * row[i].v / wall,
+               1e3 * row[i].v / (passes ? passes : 1), row[i].note);
+}
+
 static void moe(float *out, const float *x, const DSV4LayerW *w,
                 const DSV4Cfg *c, DSV4Scratch *s, const DSV4ExpertSrc *src,
                 int layer, int token_id)
 {
+    double t0 = pnow();
     dsv4_mmq(s->gate_scores, x, &w->moe.gate);
     dsv4_route(s->topk_idx, s->topk_w, s->gate_scores, s->gate_orig,
                w->moe.bias, w->moe.tid2eid, token_id,
                c->n_experts, c->topk, c->routed_scale);
+    dsv4_prof.gate += pnow() - t0;
 
     for (int i = 0; i < c->hidden; i++) out[i] = 0.0f;
 
@@ -340,18 +374,24 @@ static void moe(float *out, const float *x, const DSV4LayerW *w,
      * every activation was correct, and the caller handed one of them a buffer
      * that aliased its own input. The whole-block oracle caught it. */
     for (int k = 0; k < c->topk; k++) {
+        t0 = pnow();
         const DSV4ExpertW *e = src->get(src->ctx, layer, s->topk_idx[k]);
+        const double t1 = pnow();
+        dsv4_prof.expert_io += t1 - t0;
         if (!e) continue;                    /* caller-reported; see header */
         expert_forward(s->expert_acc, x, e, s, c->hidden, c->moe_inter,
                        c->swiglu_limit);
         const float wk = s->topk_w[k];
         for (int i = 0; i < c->hidden; i++) out[i] += wk * s->expert_acc[i];
+        dsv4_prof.expert_mm += pnow() - t1;
     }
 
     /* The shared expert is added UNWEIGHTED, after the routed sum. */
+    t0 = pnow();
     expert_forward(s->expert_acc, x, &w->moe.shared, s, c->hidden,
                    c->moe_inter * c->n_shared, c->swiglu_limit);
     for (int i = 0; i < c->hidden; i++) out[i] += s->expert_acc[i];
+    dsv4_prof.shared += pnow() - t0;
 }
 
 /* One decoder layer. `h` is [hc_mult][hidden] in and out. */
@@ -364,13 +404,18 @@ void dsv4_layer_forward(float *h, const DSV4LayerW *w, const DSV4Cfg *c,
     const size_t wide = (size_t)hc * d;
 
     /* ---- attention half ---- */
+    double t0 = pnow();
     memcpy(s->resid, h, wide * sizeof(float));
     dsv4_hc_pre(s->x1, s->post, s->comb, s->mixes, h, &w->hc_attn,
                 hc, d, c->hc_sinkhorn_iters, c->rms_eps, c->hc_eps);
     dsv4_rmsnorm(s->x1, s->x1, w->attn_norm, d, c->rms_eps);
+    double t1 = pnow();
+    dsv4_prof.hc += t1 - t0;
 
     const int n_idx = dsv4_window_idxs(s->idxs, pos, c->sliding_window);
     attention(s->qr, s->x1, w, c, s, st, cs, sn, pos, n_idx);
+    t0 = pnow();
+    dsv4_prof.attn += t0 - t1;
 
     dsv4_hc_post(h, s->qr, s->resid, s->post, s->comb, hc, d);
 
@@ -379,8 +424,11 @@ void dsv4_layer_forward(float *h, const DSV4LayerW *w, const DSV4Cfg *c,
     dsv4_hc_pre(s->x1, s->post, s->comb, s->mixes, h, &w->hc_ffn,
                 hc, d, c->hc_sinkhorn_iters, c->rms_eps, c->hc_eps);
     dsv4_rmsnorm(s->x1, s->x1, w->ffn_norm, d, c->rms_eps);
+    dsv4_prof.hc += pnow() - t0;
 
     moe(s->qr, s->x1, w, c, s, src, w->layer, token_id);
 
+    t0 = pnow();
     dsv4_hc_post(h, s->qr, s->resid, s->post, s->comb, hc, d);
+    dsv4_prof.hc += pnow() - t0;
 }
