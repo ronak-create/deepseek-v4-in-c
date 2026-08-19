@@ -18,6 +18,7 @@
 #include <string.h>
 #include <math.h>
 #include "dsv4_st.h"
+#include "dsv4_cfg.h"
 
 static int fails = 0;
 
@@ -63,7 +64,7 @@ int main(void)
         return 1;
     }
     printf("  ok    %d shard(s), %d tensors\n", s.nshard, s.nt);
-    CHECK(s.nt == 38, "indexed %d tensors, expected 38", s.nt);
+    CHECK(s.nt == 52, "indexed %d tensors, expected 52", s.nt);
 
     printf("\n-- GATE 2  the three storage formats --\n");
     /* BF16, no scale partner. */
@@ -151,6 +152,74 @@ int main(void)
             dsv4_st_close(&bad);
         } else {
             printf("  ok    correctly refused an unknown dtype\n");
+        }
+    }
+
+    printf("\n-- GATE 7  every shape must be DERIVABLE from config --\n");
+    /* A binder computes each tensor's expected shape from the config and refuses
+     * a checkpoint that disagrees. That only works if the derivation is right, so
+     * derive from Flash's real config and compare against the real shapes. Any
+     * hard-coded 32768 or 8192 that is not an expression of config values fails
+     * here the moment Pro is loaded. */
+    {
+        DSV4Cfg c;
+        int cr[DSV4_MAX_LAYERS];
+        if (!dsv4_cfg_load_file(&c, cr, DSV4_MAX_LAYERS,
+                                "tests/fixtures/cfg/dsv4_flash_config.json")) {
+            printf("  FAIL  could not load Flash config\n"); fails++;
+        } else {
+            DSV4St g;
+            if (dsv4_st_open(&g, "tests/fixtures/st") != 0) {
+                printf("  FAIL  could not reopen fixture\n"); fails++;
+            } else {
+                struct { const char *name; int64_t d0, d1; const char *how; } exp[] = {
+                  { "layers.2.attn.wq_a.weight",  c.q_lora,                c.hidden,
+                    "q_lora x hidden" },
+                  { "layers.2.attn.wq_b.weight",  (int64_t)c.n_heads * c.head_dim, c.q_lora,
+                    "n_heads*head_dim x q_lora" },
+                  { "layers.2.attn.wkv.weight",   c.head_dim,              c.hidden,
+                    "head_dim x hidden" },
+                  { "layers.2.attn.indexer.wq_b.weight",
+                    (int64_t)c.index_n_heads * c.index_head_dim, c.q_lora,
+                    "index_n_heads*index_head_dim x q_lora" },
+                  { "layers.2.attn.indexer.weights_proj.weight", c.index_n_heads, c.hidden,
+                    "index_n_heads x hidden" },
+                  { "layers.2.ffn.gate.weight",   c.n_experts,             c.hidden,
+                    "n_experts x hidden" },
+                  { "layers.3.ffn.gate.bias",     c.n_experts,             0,
+                    "n_experts" },
+                  { "layers.2.hc_attn_fn",        dsv4_mix_hc(&c),         dsv4_hc_dim(&c),
+                    "(2+hc_mult)*hc_mult x hc_mult*hidden" },
+                  { "layers.2.hc_attn_base",      dsv4_mix_hc(&c),         0,
+                    "(2+hc_mult)*hc_mult" },
+                  { "layers.2.ffn.shared_experts.w1.weight",
+                    (int64_t)c.moe_inter * c.n_shared, c.hidden,
+                    "moe_inter*n_shared x hidden" },
+                };
+                for (unsigned i = 0; i < sizeof exp / sizeof exp[0]; i++) {
+                    const DSV4Tensor *t = dsv4_st_find(&g, exp[i].name);
+                    if (!t) { printf("  FAIL  %s absent\n", exp[i].name); fails++; continue; }
+                    CHECK(t->shape[0] == exp[i].d0,
+                          "%s shape[0]=%lld, config derives %lld (%s)", exp[i].name,
+                          (long long)t->shape[0], (long long)exp[i].d0, exp[i].how);
+                    if (exp[i].d1)
+                        CHECK(t->shape[1] == exp[i].d1,
+                              "%s shape[1]=%lld, config derives %lld (%s)", exp[i].name,
+                              (long long)t->shape[1], (long long)exp[i].d1, exp[i].how);
+                }
+                /* The FP4 expert: stored cols are HALF the logical cols. */
+                const DSV4Tensor *ew = dsv4_st_find(&g, "layers.2.ffn.experts.0.w1.weight");
+                if (ew) {
+                    CHECK(ew->shape[0] == c.moe_inter,
+                          "expert w1 rows %lld, config derives moe_inter=%d",
+                          (long long)ew->shape[0], c.moe_inter);
+                    CHECK(ew->shape[1] * 2 == c.hidden,
+                          "expert w1 stored cols %lld x2 = %lld, config derives hidden=%d",
+                          (long long)ew->shape[1], (long long)ew->shape[1] * 2, c.hidden);
+                }
+                printf("  ok    10 shapes + the packed-FP4 expert derive exactly from config\n");
+                dsv4_st_close(&g);
+            }
         }
     }
 

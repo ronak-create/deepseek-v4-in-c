@@ -33,8 +33,21 @@ TENSORS = [
     ("layers.2.attn.attn_sink",                     "F32",     [64]),
     ("layers.2.attn.wq_a.weight",                   "F8_E4M3", [1024, 4096]),
     ("layers.2.attn.wq_a.scale",                    "F8_E8M0", [8, 32]),
+    ("layers.2.attn.wq_b.weight",                   "F8_E4M3", [32768, 1024]),
+    ("layers.2.attn.wq_b.scale",                    "F8_E8M0", [256, 8]),
     ("layers.2.attn.wkv.weight",                    "F8_E4M3", [512, 4096]),
     ("layers.2.attn.wkv.scale",                     "F8_E8M0", [4, 32]),
+    ("layers.2.attn.wo_a.weight",                   "F8_E4M3", [8192, 4096]),
+    ("layers.2.attn.wo_a.scale",                    "F8_E8M0", [64, 32]),
+    ("layers.2.attn.wo_b.weight",                   "F8_E4M3", [4096, 8192]),
+    ("layers.2.attn.wo_b.scale",                    "F8_E8M0", [32, 64]),
+    # the shared expert: FP8, not FP4, and resident rather than streamed
+    ("layers.2.ffn.shared_experts.w1.weight",       "F8_E4M3", [2048, 4096]),
+    ("layers.2.ffn.shared_experts.w1.scale",        "F8_E8M0", [16, 32]),
+    ("layers.2.ffn.shared_experts.w2.weight",       "F8_E4M3", [4096, 2048]),
+    ("layers.2.ffn.shared_experts.w2.scale",        "F8_E8M0", [32, 16]),
+    ("layers.2.ffn.shared_experts.w3.weight",       "F8_E4M3", [2048, 4096]),
+    ("layers.2.ffn.shared_experts.w3.scale",        "F8_E8M0", [16, 32]),
     # HCA compressor, present only where compress_ratio != 0
     ("layers.2.attn.compressor.ape",                "F32",     [4, 1024]),
     ("layers.2.attn.compressor.norm.weight",        "BF16",    [512]),
@@ -49,8 +62,12 @@ TENSORS = [
     ("layers.2.attn.indexer.compressor.wkv.weight", "BF16",    [256, 4096]),
     ("layers.2.attn.indexer.compressor.wgate.weight","BF16",   [256, 4096]),
     # mHC
+    # mix_hc = (2+hc_mult)*hc_mult = 24, hc_dim = hc_mult*hidden = 16384
+    # (model.py:663-667). The fn tensors are the ones a wrong derivation breaks.
+    ("layers.2.hc_attn_fn",                         "F32",     [24, 16384]),
     ("layers.2.hc_attn_base",                       "F32",     [24]),
     ("layers.2.hc_attn_scale",                      "F32",     [3]),
+    ("layers.2.hc_ffn_fn",                          "F32",     [24, 16384]),
     ("layers.2.hc_ffn_base",                        "F32",     [24]),
     ("layers.2.hc_ffn_scale",                       "F32",     [3]),
     # routing: HASH layer -> tid2eid, and NO bias.  I64 is a dtype K3 never saw.
