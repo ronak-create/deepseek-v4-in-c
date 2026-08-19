@@ -83,11 +83,41 @@ TENSORS = [
     ("layers.2.ffn.experts.0.w3.scale",             "F8_E8M0", [2048, 128]),
 
     # --- layer 3: ratio 128, NO indexer, scored routing ------------------------
+    # Deliberately complete, and deliberately WITHOUT any indexer.* tensor: the
+    # binder must not request one here, and the gate checks that it does not.
     ("layers.3.attn_norm.weight",                   "BF16",    [4096]),
+    ("layers.3.attn.q_norm.weight",                 "BF16",    [1024]),
+    ("layers.3.attn.kv_norm.weight",                "BF16",    [512]),
+    ("layers.3.attn.attn_sink",                     "F32",     [64]),
+    ("layers.3.attn.wq_a.weight",                   "F8_E4M3", [1024, 4096]),
+    ("layers.3.attn.wq_a.scale",                    "F8_E8M0", [8, 32]),
+    ("layers.3.attn.wq_b.weight",                   "F8_E4M3", [32768, 1024]),
+    ("layers.3.attn.wq_b.scale",                    "F8_E8M0", [256, 8]),
+    ("layers.3.attn.wkv.weight",                    "F8_E4M3", [512, 4096]),
+    ("layers.3.attn.wkv.scale",                     "F8_E8M0", [4, 32]),
+    ("layers.3.attn.wo_a.weight",                   "F8_E4M3", [8192, 4096]),
+    ("layers.3.attn.wo_a.scale",                    "F8_E8M0", [64, 32]),
+    ("layers.3.attn.wo_b.weight",                   "F8_E4M3", [4096, 8192]),
+    ("layers.3.attn.wo_b.scale",                    "F8_E8M0", [32, 64]),
+    # ratio 128 -> coff 1, so the compressor is HALF the width of layer 2's
     ("layers.3.attn.compressor.ape",                "F32",     [128, 512]),
+    ("layers.3.attn.compressor.norm.weight",        "BF16",    [512]),
     ("layers.3.attn.compressor.wkv.weight",         "BF16",    [512, 4096]),
+    ("layers.3.attn.compressor.wgate.weight",       "BF16",    [512, 4096]),
+    ("layers.3.hc_attn_fn",                         "F32",     [24, 16384]),
+    ("layers.3.hc_attn_base",                       "F32",     [24]),
+    ("layers.3.hc_attn_scale",                      "F32",     [3]),
+    ("layers.3.hc_ffn_fn",                          "F32",     [24, 16384]),
+    ("layers.3.hc_ffn_base",                        "F32",     [24]),
+    ("layers.3.hc_ffn_scale",                       "F32",     [3]),
     ("layers.3.ffn.gate.weight",                    "BF16",    [256, 4096]),
     ("layers.3.ffn.gate.bias",                      "F32",     [256]),
+    ("layers.3.ffn.shared_experts.w1.weight",       "F8_E4M3", [2048, 4096]),
+    ("layers.3.ffn.shared_experts.w1.scale",        "F8_E8M0", [16, 32]),
+    ("layers.3.ffn.shared_experts.w2.weight",       "F8_E4M3", [4096, 2048]),
+    ("layers.3.ffn.shared_experts.w2.scale",        "F8_E8M0", [32, 16]),
+    ("layers.3.ffn.shared_experts.w3.weight",       "F8_E4M3", [2048, 4096]),
+    ("layers.3.ffn.shared_experts.w3.scale",        "F8_E8M0", [16, 32]),
     ("layers.3.ffn_norm.weight",                    "BF16",    [4096]),
 ]
 

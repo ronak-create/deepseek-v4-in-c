@@ -260,7 +260,9 @@ typedef struct {
     DSV4HcW      hc_attn, hc_ffn;
     int          layer;
     int          compress_ratio;
-    int          hash_routed;
+    int          hash_routed;   /* layer < num_hash_layers: tid2eid, no bias */
+    int          has_comp;      /* compress_ratio != 0                       */
+    int          has_idx;       /* compress_ratio == 4                       */
 } DSV4LayerW;
 
 /* Model-level weights. All six live outside layers.* and mtp.*:

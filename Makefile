@@ -17,7 +17,7 @@ BIN   := bin
 
 .PHONY: all test cfg-fixtures st-fixtures fixtures clean help
 
-all: $(BIN)/test_cfg $(BIN)/test_st
+all: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind
 
 $(BIN)/test_cfg: tests/unit/test_cfg.c include/dsv4/dsv4.h include/dsv4/dsv4_cfg.h
 	@mkdir -p $(BIN)
@@ -36,10 +36,16 @@ st-fixtures:
 	python3 tools/make_st_fixture.py tests/fixtures/st
 fixtures: cfg-fixtures st-fixtures
 
-test: $(BIN)/test_cfg $(BIN)/test_st
+$(BIN)/test_bind: tests/unit/test_bind.c src/model/dsv4_bind.c src/model/dsv4_bind.h                   src/io/dsv4_st.c include/dsv4/dsv4.h
+	@mkdir -p $(BIN)
+	$(CC) $(CFLAGS) $(INCS) tests/unit/test_bind.c src/model/dsv4_bind.c 	      src/io/dsv4_st.c -o $@ $(LDFLAGS)
+
+test: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind
 	@./$(BIN)/test_cfg
 	@echo
 	@./$(BIN)/test_st
+	@echo
+	@./$(BIN)/test_bind
 
 clean:
 	rm -rf $(BUILD) $(BIN)
