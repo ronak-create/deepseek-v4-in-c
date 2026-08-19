@@ -164,12 +164,14 @@ int main(void)
         build(0);
         DSV4Scratch s;
         CHECK(dsv4_scratch_init(&s, &g_cfg) == 0, "scratch allocation failed");
-        float *h = alloc_f(hcd), *kv = alloc_f((size_t)WIN * HDIM);
+        float *h = alloc_f(hcd);
+        DSV4LayerState lstate;
+        dsv4_state_init(&lstate, &g_cfg, 0, 64);
         float *before = alloc_f(hcd);
         fill(h, hcd, 77, 0.1f);
         memcpy(before, h, (size_t)hcd * sizeof(float));
 
-        dsv4_layer_forward(h, &g_w, &g_cfg, &s, &src, kv, cs, sn, 0, 3);
+        dsv4_layer_forward(h, &g_w, &g_cfg, &s, &src, &lstate, cs, sn, 0, 3);
 
         int finite = 0, changed = 0;
         for (int i = 0; i < hcd; i++) {
@@ -179,7 +181,7 @@ int main(void)
         CHECK(finite == hcd, "%d of %d outputs finite", finite, hcd);
         CHECK(changed, "the block left the residual stream untouched");
         printf("  ok    %d values, all finite, stream advanced\n", hcd);
-        free(h); free(kv); free(before); dsv4_scratch_free(&s);
+        free(h); free(before); dsv4_state_free(&lstate); dsv4_scratch_free(&s);
     }
 
     printf("\n-- GATE 2  the token id reaches the router on a HASH layer --\n");
@@ -191,18 +193,21 @@ int main(void)
         build(1);
         DSV4Scratch s; dsv4_scratch_init(&s, &g_cfg);
         float *h1 = alloc_f(hcd), *h2 = alloc_f(hcd);
-        float *kv1 = alloc_f((size_t)WIN * HDIM), *kv2 = alloc_f((size_t)WIN * HDIM);
+        DSV4LayerState lstate;
         fill(h1, hcd, 88, 0.1f);
         memcpy(h2, h1, (size_t)hcd * sizeof(float));
 
-        dsv4_layer_forward(h1, &g_w, &g_cfg, &s, &src, kv1, cs, sn, 0, 1);
-        dsv4_layer_forward(h2, &g_w, &g_cfg, &s, &src, kv2, cs, sn, 0, 2);
+        dsv4_state_init(&lstate, &g_cfg, 0, 64);
+        dsv4_layer_forward(h1, &g_w, &g_cfg, &s, &src, &lstate, cs, sn, 0, 1);
+        dsv4_state_free(&lstate);
+        dsv4_state_init(&lstate, &g_cfg, 0, 64);
+        dsv4_layer_forward(h2, &g_w, &g_cfg, &s, &src, &lstate, cs, sn, 0, 2);
 
         CHECK(memcmp(h1, h2, (size_t)hcd * sizeof(float)) != 0,
               "tokens 1 and 2 gave identical output; token_id is not reaching "
               "the hash router");
         printf("  ok    token 1 and token 2 route differently\n");
-        free(h1); free(h2); free(kv1); free(kv2); dsv4_scratch_free(&s);
+        free(h1); free(h2); dsv4_state_free(&lstate); dsv4_scratch_free(&s);
     }
 
     printf("\n-- GATE 3  on a SCORED layer the token id is irrelevant --\n");
@@ -213,31 +218,36 @@ int main(void)
         build(0);
         DSV4Scratch s; dsv4_scratch_init(&s, &g_cfg);
         float *h1 = alloc_f(hcd), *h2 = alloc_f(hcd);
-        float *kv1 = alloc_f((size_t)WIN * HDIM), *kv2 = alloc_f((size_t)WIN * HDIM);
+        DSV4LayerState lstate;
         fill(h1, hcd, 88, 0.1f);
         memcpy(h2, h1, (size_t)hcd * sizeof(float));
 
-        dsv4_layer_forward(h1, &g_w, &g_cfg, &s, &src, kv1, cs, sn, 0, 1);
-        dsv4_layer_forward(h2, &g_w, &g_cfg, &s, &src, kv2, cs, sn, 0, 9);
+        dsv4_state_init(&lstate, &g_cfg, 0, 64);
+        dsv4_layer_forward(h1, &g_w, &g_cfg, &s, &src, &lstate, cs, sn, 0, 1);
+        dsv4_state_free(&lstate);
+        dsv4_state_init(&lstate, &g_cfg, 0, 64);
+        dsv4_layer_forward(h2, &g_w, &g_cfg, &s, &src, &lstate, cs, sn, 0, 9);
 
         CHECK(memcmp(h1, h2, (size_t)hcd * sizeof(float)) == 0,
               "a scored layer's output depends on token_id; it must not");
         printf("  ok    tokens 1 and 9 give identical output\n");
-        free(h1); free(h2); free(kv1); free(kv2); dsv4_scratch_free(&s);
+        free(h1); free(h2); dsv4_state_free(&lstate); dsv4_scratch_free(&s);
     }
 
     printf("\n-- GATE 4  position advances the KV ring and changes the output --\n");
     {
         build(0);
         DSV4Scratch s; dsv4_scratch_init(&s, &g_cfg);
-        float *h = alloc_f(hcd), *kv = alloc_f((size_t)WIN * HDIM);
+        float *h = alloc_f(hcd);
+        DSV4LayerState lstate;
+        dsv4_state_init(&lstate, &g_cfg, 0, 64);
         float prev[HC * HID];
         fill(h, hcd, 55, 0.1f);
 
         int distinct = 0;
         for (int pos = 0; pos < WIN + 2; pos++) {
             memcpy(prev, h, (size_t)hcd * sizeof(float));
-            dsv4_layer_forward(h, &g_w, &g_cfg, &s, &src, kv, cs, sn, pos, 3);
+        dsv4_layer_forward(h, &g_w, &g_cfg, &s, &src, &lstate, cs, sn, pos, 3);
             for (int i = 0; i < hcd; i++)
                 if (!isfinite(h[i])) { CHECK(0, "non-finite at pos %d", pos); break; }
             if (memcmp(prev, h, (size_t)hcd * sizeof(float)) != 0) distinct++;
@@ -248,13 +258,13 @@ int main(void)
         int nonzero_rows = 0;
         for (int r = 0; r < WIN; r++) {
             int nz = 0;
-            for (int c = 0; c < HDIM; c++) if (kv[r * HDIM + c] != 0.0f) nz = 1;
+            for (int c = 0; c < HDIM; c++) if (lstate.kv_cache[r * HDIM + c] != 0.0f) nz = 1;
             nonzero_rows += nz;
         }
         CHECK(nonzero_rows == WIN, "%d of %d ring rows written", nonzero_rows, WIN);
         printf("  ok    %d steps, all finite, all %d ring rows written\n",
                WIN + 2, WIN);
-        free(h); free(kv); dsv4_scratch_free(&s);
+        free(h); dsv4_state_free(&lstate); dsv4_scratch_free(&s);
     }
 
     printf("\n-- GATE 5  the FFN residual is taken AFTER the attention half --\n");
@@ -268,12 +278,14 @@ int main(void)
          * the residual carries it. */
         build(0);
         DSV4Scratch s; dsv4_scratch_init(&s, &g_cfg);
-        float *h = alloc_f(hcd), *kv = alloc_f((size_t)WIN * HDIM);
+        float *h = alloc_f(hcd);
+        DSV4LayerState lstate;
+        dsv4_state_init(&lstate, &g_cfg, 0, 64);
         float *in = alloc_f(hcd);
         fill(in, hcd, 99, 0.1f);
 
         memcpy(h, in, (size_t)hcd * sizeof(float));
-        dsv4_layer_forward(h, &g_w, &g_cfg, &s, &src, kv, cs, sn, 0, 3);
+        dsv4_layer_forward(h, &g_w, &g_cfg, &s, &src, &lstate, cs, sn, 0, 3);
         float ref[HC * HID]; memcpy(ref, h, sizeof ref);
 
         /* Zero wo_b so attention contributes nothing to x, leaving only the
@@ -282,8 +294,8 @@ int main(void)
         uint16_t *zeros = (uint16_t *)calloc((size_t)HID * OGRP * OLORA, 2);
         g_w.attn.wo_b.w = zeros;
         memcpy(h, in, (size_t)hcd * sizeof(float));
-        memset(kv, 0, (size_t)WIN * HDIM * sizeof(float));
-        dsv4_layer_forward(h, &g_w, &g_cfg, &s, &src, kv, cs, sn, 0, 3);
+        dsv4_state_free(&lstate); dsv4_state_init(&lstate, &g_cfg, 0, 64);
+        dsv4_layer_forward(h, &g_w, &g_cfg, &s, &src, &lstate, cs, sn, 0, 3);
 
         CHECK(memcmp(ref, h, sizeof ref) != 0,
               "zeroing the attention output changed nothing; attention is not "
@@ -295,7 +307,7 @@ int main(void)
         g_w.attn.wo_b = saved; free(zeros);
         printf("  ok    attention reaches the stream, and the FFN half still "
                "advances without it\n");
-        free(h); free(kv); free(in); dsv4_scratch_free(&s);
+        free(h); free(in); dsv4_state_free(&lstate); dsv4_scratch_free(&s);
     }
 
     printf("\n");

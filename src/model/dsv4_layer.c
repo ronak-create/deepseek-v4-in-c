@@ -43,6 +43,7 @@
 #include "dsv4.h"
 #include "dsv4_bind.h"
 #include "dsv4_layer.h"
+#include "dsv4_quant.h"
 
 /* Kernels this file wires together. */
 void dsv4_rmsnorm(float *, const float *, const float *, int, float);
@@ -54,6 +55,14 @@ void dsv4_rope_apply(float *, int, int, const float *, const float *, int, int, 
 void dsv4_sparse_attn(float *, const float *, const float *, const float *,
                       const int *, int, int, int, float, float *);
 int  dsv4_window_idxs(int *, int, int);
+int  dsv4_compress_step(float *, const float *, const float *, const float *,
+                        float *, float *, int, int, int);
+int  dsv4_compress_rope_pos(int, int);
+void dsv4_indexer_score(float *, const float *, const float *, const float *,
+                        int, int, int);
+int  dsv4_topk(int *, const float *, int, int);
+void dsv4_indexer_offset(int *, int, int);
+int  dsv4_indexer_navail(int, int);
 void dsv4_hc_pre(float *, float *, float *, float *, const float *,
                  const DSV4HcW *, int, int, int, float, float);
 void dsv4_hc_post(float *, const float *, const float *, const float *,
@@ -61,6 +70,46 @@ void dsv4_hc_post(float *, const float *, const float *, const float *,
 
 
 
+
+
+/* ------------------------------------------------------------ layer state --- */
+
+int dsv4_state_init(DSV4LayerState *st, const DSV4Cfg *c, int layer, int max_pos)
+{
+    memset(st, 0, sizeof *st);
+    /* dsv4_compress_ratio returns -1 for a layer outside the map, and -1 is
+     * TRUTHY. Writing `ratio ? ... : 0` therefore took the compressed branch and
+     * computed max_pos / -1 + 1, a negative count that became an enormous
+     * size_t. Clamp to 0 here so "no compressor" has exactly one spelling. */
+    int ratio = dsv4_compress_ratio(c, layer);
+    if (ratio < 0) ratio = 0;
+    const int coff  = (ratio == 4) ? 2 : 1;
+    const int hd    = c->head_dim;
+
+    const size_t ncomp = ratio ? (size_t)(max_pos / ratio + 1) : 0;
+    const size_t kvn   = ((size_t)c->sliding_window + ncomp) * (size_t)hd;
+    const size_t cn    = ratio ? (size_t)coff * ratio * coff * hd : 0;
+
+    float *a = (float *)calloc(kvn + 2 * cn, sizeof(float));
+    if (!a) return -1;
+    st->arena = a;
+    st->kv_cache = a;
+    if (ratio) {
+        st->comp_kv    = a + kvn;
+        st->comp_score = a + kvn + cn;
+        /* -INFINITY, not zero: an unfilled slot must contribute nothing to the
+         * pooling softmax. Zeros would give it uniform weight instead. */
+        for (size_t i = 0; i < cn; i++) st->comp_score[i] = -INFINITY;
+    }
+    return 0;
+}
+
+void dsv4_state_free(DSV4LayerState *st)
+{
+    if (!st) return;
+    free(st->arena);
+    memset(st, 0, sizeof *st);
+}
 
 /* ---------------------------------------------------------------- scratch --- */
 
@@ -89,7 +138,11 @@ int dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c)
         + (size_t)c->n_experts * 2                  /* gate scores + orig  */
         + inter * 3                                 /* expert gate/up/out  */
         + nidx                                      /* attention scratch   */
-        + d;                                        /* expert_acc          */
+        + d                                         /* expert_acc          */
+        + 4u * (size_t)c->head_dim                  /* comp kv/score in    */
+        + (size_t)c->index_n_heads * (size_t)c->index_head_dim  /* idx q  */
+        + (size_t)c->index_n_heads                  /* idx head weights    */
+        + (size_t)(c->max_pos ? 4096 : 4096);       /* idx scores          */
 
     /* qr must hold max(q_lora, hidden): it carries the q latent and is reused
      * for the block's hidden-width output. Sizing it to q_lora alone overflows
@@ -118,6 +171,11 @@ int dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c)
     s->expert_out = p;   p += inter;
     s->attn_scratch = p; p += nidx;
     s->expert_acc = p;   p += d;
+    s->comp_kv_in = p;   p += 2u * (size_t)c->head_dim;
+    s->comp_sc_in = p;   p += 2u * (size_t)c->head_dim;
+    s->idx_q = p;        p += (size_t)c->index_n_heads * (size_t)c->index_head_dim;
+    s->idx_w = p;        p += (size_t)c->index_n_heads;
+    s->idx_scores = p;   p += 4096;
 
     s->idxs = (int *)calloc(nidx, sizeof(int));
     if (!s->idxs) { free(a); s->arena = NULL; return -1; }
@@ -148,10 +206,11 @@ static void expert_forward(float *out, const float *x, const DSV4ExpertW *e,
  * compressed rows when the layer has a compressor. idxs must already hold the
  * window slots and any compressed selections, in cache coordinates. */
 static void attention(float *out, const float *x, const DSV4LayerW *w,
-                      const DSV4Cfg *c, DSV4Scratch *s, float *kv_cache,
+                      const DSV4Cfg *c, DSV4Scratch *s, DSV4LayerState *st,
                       const float *cs, const float *sn, int pos, int n_idx)
 {
     const int hd = c->head_dim, rd = c->qk_rope, H = c->n_heads;
+    float *kv_cache = st->kv_cache;
 
     /* q: learned norm on the latent, then the per-head unweighted norm. */
     dsv4_mmq(s->qr, x, &w->attn.wq_a);
@@ -172,6 +231,56 @@ static void attention(float *out, const float *x, const DSV4LayerW *w,
     dsv4_rope_apply(s->kv, hd, rd, cs, sn, pos, rd / 2, 0);
     memcpy(kv_cache + (size_t)(pos % c->sliding_window) * hd, s->kv,
            (size_t)hd * sizeof(float));
+
+    /* ---- HCA: pool `ratio` tokens into one compressed row ----
+     * The compressor sees the SAME normed x attention does (model.py calls it
+     * from inside Attention.forward, after attn_norm), and writes into the tail
+     * of kv_cache, past the sliding window. */
+    if (w->has_comp) {
+        const int ratio = w->compress_ratio;
+        const int coff  = (ratio == 4) ? 2 : 1;
+        const int width = coff * hd;
+        dsv4_mmq(s->comp_kv_in, x, &w->attn.comp.wkv);
+        dsv4_mmq(s->comp_sc_in, x, &w->attn.comp.wgate);
+        if (dsv4_compress_step(s->kv, s->comp_kv_in, s->comp_sc_in,
+                               w->attn.comp.ape, st->comp_kv, st->comp_score,
+                               pos, ratio, hd)) {
+            dsv4_rmsnorm(s->kv, s->kv, w->attn.comp.norm, hd, c->rms_eps);
+            /* Stamped with the FIRST position of the window it summarises. */
+            dsv4_rope_apply(s->kv, hd, rd, cs, sn,
+                            dsv4_compress_rope_pos(pos, ratio), rd / 2, 0);
+            memcpy(kv_cache + (size_t)(c->sliding_window + st->n_compressed) * hd,
+                   s->kv, (size_t)hd * sizeof(float));
+            st->n_compressed++;
+        }
+        (void)width;
+
+        /* ---- which compressed rows may attention see? ----
+         * ratio 4 selects index_topk of them with the CSA indexer; every other
+         * ratio takes them all, in order. Both then offset into the cache by
+         * sliding_window, because the window occupies the front. */
+        const int avail = st->n_compressed;
+        int take = avail;
+        if (avail > 0) {
+            if (w->has_idx) {
+                dsv4_mmq(s->idx_q, s->qr, &w->attn.idx.wq_b);
+                for (int h = 0; h < c->index_n_heads; h++)
+                    dsv4_rope_apply(s->idx_q + (size_t)h * c->index_head_dim,
+                                    c->index_head_dim, rd, cs, sn, pos, rd / 2, 0);
+                dsv4_mmq(s->idx_w, x, &w->attn.idx.weights_proj);
+                dsv4_indexer_score(s->idx_scores, s->idx_q,
+                                   kv_cache + (size_t)c->sliding_window * hd,
+                                   s->idx_w, c->index_n_heads,
+                                   c->index_head_dim, avail);
+                take = avail < c->index_topk ? avail : c->index_topk;
+                dsv4_topk(s->idxs + n_idx, s->idx_scores, avail, take);
+            } else {
+                for (int i = 0; i < take; i++) s->idxs[n_idx + i] = i;
+            }
+            dsv4_indexer_offset(s->idxs + n_idx, take, c->sliding_window);
+            n_idx += take;
+        }
+    }
 
     dsv4_sparse_attn(s->o, s->q, kv_cache, w->attn.sink, s->idxs,
                      H, hd, n_idx, 1.0f / sqrtf((float)hd), s->attn_scratch);
@@ -248,7 +357,7 @@ static void moe(float *out, const float *x, const DSV4LayerW *w,
 /* One decoder layer. `h` is [hc_mult][hidden] in and out. */
 void dsv4_layer_forward(float *h, const DSV4LayerW *w, const DSV4Cfg *c,
                         DSV4Scratch *s, const DSV4ExpertSrc *src,
-                        float *kv_cache, const float *cs, const float *sn,
+                        DSV4LayerState *st, const float *cs, const float *sn,
                         int pos, int token_id)
 {
     const int hc = c->hc_mult, d = c->hidden;
@@ -261,7 +370,7 @@ void dsv4_layer_forward(float *h, const DSV4LayerW *w, const DSV4Cfg *c,
     dsv4_rmsnorm(s->x1, s->x1, w->attn_norm, d, c->rms_eps);
 
     const int n_idx = dsv4_window_idxs(s->idxs, pos, c->sliding_window);
-    attention(s->qr, s->x1, w, c, s, kv_cache, cs, sn, pos, n_idx);
+    attention(s->qr, s->x1, w, c, s, st, cs, sn, pos, n_idx);
 
     dsv4_hc_post(h, s->qr, s->resid, s->post, s->comb, hc, d);
 

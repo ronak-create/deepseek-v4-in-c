@@ -177,7 +177,12 @@ int main(void)
     if (dsv4_scratch_init(&s, &c) != 0) { printf("  FAIL  scratch\n"); return 1; }
     DSV4ExpertSrc src = { get_expert, NULL };
 
-    static float h[512], kv[4096];
+    static float h[512];
+    DSV4LayerState lstate;
+    if (dsv4_state_init(&lstate, &c, 0, 64) != 0) {
+        printf("  FAIL  layer state allocation\n");
+        return 1;
+    }
     nf("h_in", h, 512);
     const int steps = (int)cnum(G, "steps");
     const int token_id = (int)cnum(G, "token_id");
@@ -186,7 +191,7 @@ int main(void)
     printf("\n-- %d positions, KV ring of %d (so it wraps) --\n",
            steps, c.sliding_window);
     for (int pos = 0; pos < steps; pos++) {
-        dsv4_layer_forward(h, &w, &c, &s, &src, kv, cs, sn, pos, token_id);
+        dsv4_layer_forward(h, &w, &c, &s, &src, &lstate, cs, sn, pos, token_id);
 
         jval *row = outs->kids[pos];
         float worst = 0.0f; int at = -1;
@@ -215,6 +220,7 @@ int main(void)
                    pos, (double)worst, hc * d);
     }
 
+    dsv4_state_free(&lstate);
     dsv4_scratch_free(&s);
     printf("\n");
     if (fails) { printf("BLOCK ORACLE GATE FAILED: %d check(s)\n", fails); return 1; }
