@@ -143,7 +143,7 @@ int main(void)
         printf("  ok    128x128 and 1x32 indexing are distinct and correct\n");
     }
 
-    printf("\n-- GATE 5  FP4 packing: bijective, but ORDER IS UNVERIFIED --\n");
+    printf("\n-- GATE 5  FP4 packing: the LOW nibble is the EVEN element --\n");
     {
         /* What is knowable without a reference: the two nibbles of a byte
          * decode to the two distinct codes, and every element index maps to
@@ -163,9 +163,29 @@ int main(void)
                   "elements %d and %d decoded identically; the nibble split is wrong",
                   i, i + 1);
         printf("  ok    every element decodes to a table value; pairs are distinct\n");
-        printf("  NOTE  which nibble is the EVEN element is documented (OCP MX /\n");
-        printf("        PyTorch) but NOT measured. See task: verify against torch.\n");
-        printf("        Until then, FP4 output is unvalidated.\n");
+
+        /* THE ORDER ITSELF, from torch/headeronly/util/Float4_e2m1fn_x2.h:
+         *
+         *     original value             | val1 : val0
+         *     bit index (MSB==7, LSB==0) | 7654 : 3210
+         *
+         * val0 -- the first, even-indexed element -- is the LOW nibble. That
+         * header is normative here, not merely conventional, because the
+         * checkpoint's expert weights were written BY PyTorch into this dtype.
+         *
+         * Byte 0x21: low nibble 1 -> 0.5 at index 0, high nibble 2 -> 1.0 at
+         * index 1. Swap the convention and this reads {1.0, 0.5}. */
+        {
+            uint8_t one[1] = { 0x21 };
+            CHECK(dsv4_fp4_at(one, 0) == 0.5f,
+                  "element 0 = %.3f, expected 0.5 (low nibble of 0x21)",
+                  (double)dsv4_fp4_at(one, 0));
+            CHECK(dsv4_fp4_at(one, 1) == 1.0f,
+                  "element 1 = %.3f, expected 1.0 (high nibble of 0x21)",
+                  (double)dsv4_fp4_at(one, 1));
+            printf("  ok    0x21 -> {%.1f, %.1f}, matching PyTorch's val1:val0\n",
+                   (double)dsv4_fp4_at(one, 0), (double)dsv4_fp4_at(one, 1));
+        }
     }
 
     printf("\n");

@@ -28,25 +28,43 @@
  *                       The 128x128 in config.json's weight_block_size describes
  *                       the FP8 tensors only.
  *
- * WHAT IS NOT VERIFIED
- *   DSV4_FP4_LOW_NIBBLE_FIRST. kernel.py delegates packing to the
- *   float4_e2m1fn_x2 dtype itself, so the source never states which nibble holds
- *   the even-indexed element. The value below follows the OCP Microscaling spec
- *   and PyTorch's convention, but it is DOCUMENTED, NOT MEASURED, and it is
- *   deliberately a single named constant so that settling it is a one-line
- *   change rather than an archaeology exercise.
+ * THE NIBBLE ORDER, NOW SETTLED
+ *   kernel.py delegates packing to the float4_e2m1fn_x2 dtype, so nothing in
+ *   the checkpoint states which nibble holds the even-indexed element. But the
+ *   checkpoint was WRITTEN by PyTorch into that dtype, which makes PyTorch's
+ *   definition of it the specification rather than a convention to guess at.
  *
- *   Getting it wrong swaps adjacent weights within every pair. The value
- *   HISTOGRAM is unchanged, so no statistical sanity check can catch it; only a
- *   bit-exact comparison against a reference can. Until that comparison exists,
- *   treat any output from the FP4 path as unvalidated.
+ *   From torch/headeronly/util/Float4_e2m1fn_x2.h (torch 2.11.0+cu128), which
+ *   cites OCP Microscaling Formats MX v1.0 section 5.3.3:
+ *
+ *       original value             | val1 : val0
+ *       ========================================
+ *       bit index (MSB==7, LSB==0) | 7654 : 3210
+ *       sign/exponent/mantissa     | seem : seem
+ *
+ *   val0 -- the FIRST, even-indexed element -- is bits 3..0, the LOW nibble.
+ *   So DSV4_FP4_LOW_NIBBLE_FIRST = 1 is correct.
+ *
+ *   This was worth pinning down rather than assuming. Getting it wrong swaps
+ *   adjacent weights within every pair, and the value HISTOGRAM is unchanged,
+ *   so no statistical check could ever have caught it -- only a normative
+ *   statement or a bit-exact reference comparison.
+ *
+ *   Two routes were tried first and both dead-ended, which is why the citation
+ *   above is the evidence rather than a measurement: torch implements NO
+ *   element-wise conversion for this dtype on CPU (copy_kernel unimplemented),
+ *   and on CUDA sm_120 the generic cast asserts inside fetch_and_cast. FP4 is
+ *   reachable only through specific ops such as _scaled_mm, never through .to().
  */
 #ifndef DSV4_QUANT_H
 #define DSV4_QUANT_H
 
 #include <stdint.h>
 
-#define DSV4_FP4_LOW_NIBBLE_FIRST 1   /* UNVERIFIED - see the note above */
+/* val0 (even element) is the LOW nibble. Established from PyTorch's own
+ * Float4_e2m1fn_x2.h, which is normative here because the checkpoint was
+ * written by PyTorch into that dtype. See the header note above. */
+#define DSV4_FP4_LOW_NIBBLE_FIRST 1
 
 /* ------------------------------------------------------------ E8M0 scale ---
  * 2^(b-127), exponent only. Built by bit assembly rather than by ldexp so the
@@ -133,7 +151,7 @@ static inline float dsv4_e2m1_to_f32(uint8_t nibble)
 /* Element i of a packed FP4 row. `row` is the stored bytes; i is the LOGICAL
  * element index, so the byte is i/2 and the nibble is chosen by i&1.
  *
- * THIS IS THE UNVERIFIED PART. See DSV4_FP4_LOW_NIBBLE_FIRST above. */
+ * Order per PyTorch's Float4_e2m1fn_x2.h: val0 is bits 3..0. */
 static inline float dsv4_fp4_at(const uint8_t *row, int64_t i)
 {
     const uint8_t byte = row[i >> 1];
