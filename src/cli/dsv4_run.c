@@ -196,6 +196,24 @@ int main(int argc, char **argv)
     const double t0 = now_s();
     int ntok = 0;
 
+    /* PROMPT TOKENS GO THROUGH ONE AT A TIME, and that is not an oversight.
+     *
+     * The obvious improvement is layer-major prefill: bind layer L once, run
+     * every prompt token through it, then move to L+1, so a layer's 165 MB of
+     * weights is touched once per prompt instead of once per token. It was
+     * built and measured on 2026-08-20. It is bit-exact -- all 26 generated ids
+     * identical -- and it is NOT faster: 73.6 s against a 66.0-69.9 s baseline.
+     *
+     * It saves nothing because the trunk is fully PINNED, so there is no disk
+     * read to avoid, and 165 MB per layer dwarfs the ~24 MB L3, so keeping a
+     * layer resident across 15 tokens buys no cache reuse either. Each token
+     * still performs the same GEMV against the same bytes.
+     *
+     * What would win is a batched GEMM -- one weight row loaded once and used
+     * for all N tokens' dot products, taking arithmetic intensity from ~1
+     * flop/byte to ~N -- which needs a batched variant of every matmul and of
+     * attention. That is a different change, and layer-major is only its
+     * scaffolding. See task notes. */
     for (int pos = 0; pos < nprompt + ngen; pos++) {
         const int32_t tid = (pos < nprompt) ? ids[pos] : ids[pos];
 
