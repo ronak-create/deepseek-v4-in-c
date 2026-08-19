@@ -133,7 +133,11 @@ typedef struct {
     /* ---- quantisation ---- */
     int   wblock_m, wblock_n; /* 128 x 128                                      */
 
-    /* ---- present in config, deliberately unimplemented ---- */
+    /* ---- routing and MTP ---- */
+    /* num_hash_layers IS implemented: layers below it route by tid2eid lookup
+     * (dsv4_ops.c:112) and the whole-model oracle exercises one. Only the MTP
+     * module is skipped -- it predicts extra tokens and is not part of the
+     * single-token forward pass. */
     int   num_hash_layers;    /* 3                                              */
     int   num_nextn_predict;  /* 1: MTP module, skipped at inference            */
 } DSV4Cfg;
