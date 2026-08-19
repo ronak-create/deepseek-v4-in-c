@@ -30,7 +30,7 @@ ENGINE := $(wildcard src/core/*.c src/core/*.h src/io/*.c src/io/*.h \
                      src/cache/*.c src/cache/*.h src/model/*.c src/model/*.h \
                      src/tokenizer/*.c src/tokenizer/*.h \
                      include/dsv4/*.h third_party/*.h)
-ALLBIN := $(BIN)/dsv4 $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress $(BIN)/test_indexer $(BIN)/test_layer $(BIN)/test_cache $(BIN)/test_bindmem $(BIN)/test_oracle $(BIN)/test_layer_oracle $(BIN)/test_trunk $(BIN)/test_tok $(BIN)/test_model_oracle
+ALLBIN := $(BIN)/test_pro $(BIN)/dsv4 $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress $(BIN)/test_indexer $(BIN)/test_layer $(BIN)/test_cache $(BIN)/test_bindmem $(BIN)/test_oracle $(BIN)/test_layer_oracle $(BIN)/test_trunk $(BIN)/test_tok $(BIN)/test_model_oracle
 
 all: $(ALLBIN)
 
@@ -133,6 +133,10 @@ $(BIN)/dsv4: src/cli/dsv4_run.c $(DSV4_ENGINE)
 	@mkdir -p $(BIN)
 	$(CC) $(CFLAGS) $(INCS) src/cli/dsv4_run.c $(DSV4_ENGINE) -o $@ $(LDFLAGS)
 
+$(BIN)/test_pro: tests/unit/test_pro.c $(DSV4_ENGINE)
+	@mkdir -p $(BIN)
+	$(CC) $(CFLAGS) $(INCS) tests/unit/test_pro.c $(DSV4_ENGINE) -o $@ $(LDFLAGS)
+
 $(BIN)/test_model_oracle: tests/unit/test_model_oracle.c $(DSV4_ENGINE)
 	@mkdir -p $(BIN)
 	$(CC) $(CFLAGS) $(INCS) tests/unit/test_model_oracle.c $(DSV4_ENGINE) -o $@ $(LDFLAGS)
@@ -141,7 +145,7 @@ tiny-fixture:
 	~/venv-cuda/bin/python tools/make_tiny_checkpoint.py $(HOME)/dsv4-tiny
 	python3 tools/pack_trunk.py $(HOME)/dsv4-tiny $(HOME)/dsv4-tiny-trunk
 
-test: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress $(BIN)/test_indexer $(BIN)/test_layer $(BIN)/test_cache $(BIN)/test_bindmem $(BIN)/test_oracle $(BIN)/test_layer_oracle $(BIN)/test_trunk $(BIN)/test_tok $(BIN)/test_model_oracle
+test: $(BIN)/test_pro $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress $(BIN)/test_indexer $(BIN)/test_layer $(BIN)/test_cache $(BIN)/test_bindmem $(BIN)/test_oracle $(BIN)/test_layer_oracle $(BIN)/test_trunk $(BIN)/test_tok $(BIN)/test_model_oracle
 	@./$(BIN)/test_cfg
 	@echo
 	@./$(BIN)/test_st
@@ -179,6 +183,8 @@ test: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/t
 	@./$(BIN)/test_tok
 	@echo
 	@DSV4_TINY=$(HOME)/dsv4-tiny DSV4_TINY_TRUNK=$(HOME)/dsv4-tiny-trunk ./$(BIN)/test_model_oracle
+	@echo
+	@./$(BIN)/test_pro
 
 clean:
 	rm -rf $(BUILD) $(BIN)
