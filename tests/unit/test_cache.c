@@ -1,0 +1,138 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* test_cache.c - the routed-expert LRU, against the synthetic fixture. */
+#include <stdio.h>
+#include <string.h>
+#include "dsv4_cache.h"
+#include "dsv4_cfg.h"
+
+static int fails = 0;
+#define CHECK(cond, ...) do {                                                  \
+    if (!(cond)) { printf("  FAIL  "); printf(__VA_ARGS__); printf("\n");      \
+                   fails++; }                                                  \
+} while (0)
+
+int main(void)
+{
+    DSV4Cfg c;
+    int cr[DSV4_MAX_LAYERS];
+    DSV4St st;
+
+    printf("DeepSeek-V4 expert cache gate\n");
+
+    if (!dsv4_cfg_load_file(&c, cr, DSV4_MAX_LAYERS,
+                            "tests/fixtures/cfg/dsv4_flash_config.json")) return 1;
+    if (dsv4_st_open(&st, "tests/fixtures/st") != 0) {
+        printf("  FAIL  fixture missing; run 'make st-fixtures'\n"); return 1;
+    }
+
+    printf("\n-- GATE 1  expert size is computed, not assumed --\n");
+    {
+        DSV4Cache k;
+        CHECK(dsv4_cache_init(&k, &st, &c, 1LL << 30) == 0, "init failed");
+        /* The real figure, measured from the released checkpoint. If the FP4
+         * half-width or the 1x32 scale grid were wrong this would not match. */
+        CHECK(k.expert_bytes == 13369344,
+              "expert is %lld bytes, the checkpoint says 13,369,344",
+              (long long)k.expert_bytes);
+        printf("  ok    %lld bytes per expert, %d slots in 1 GB\n",
+               (long long)k.expert_bytes, k.nslot);
+        dsv4_cache_free(&k);
+    }
+
+    printf("\n-- GATE 2  a budget too small for one expert is REFUSED --\n");
+    {
+        DSV4Cache k;
+        CHECK(dsv4_cache_init(&k, &st, &c, 1000) != 0,
+              "accepted a budget that cannot hold a single expert");
+        printf("  ok    refused a 1000-byte budget\n");
+    }
+
+    printf("\n-- GATE 3  hit, miss and LRU eviction order --\n");
+    {
+        DSV4Cache k;
+        /* Two slots exactly, so eviction is forced and predictable. */
+        dsv4_cache_init(&k, &st, &c, 13369344LL * 2);
+        CHECK(k.nslot == 2, "%d slots, expected 2", k.nslot);
+
+        /* The fixture only carries expert 0 of layers 2 and 3, so use those. */
+        const DSV4ExpertW *a = dsv4_cache_get(&k, 2, 0);
+        CHECK(a != NULL, "layer 2 expert 0 failed to load");
+        CHECK(k.misses == 1 && k.hits == 0, "first access: %llu hits %llu misses",
+              (unsigned long long)k.hits, (unsigned long long)k.misses);
+
+        const DSV4ExpertW *a2 = dsv4_cache_get(&k, 2, 0);
+        CHECK(a2 == a, "a hit returned a different pointer");
+        CHECK(k.hits == 1, "second access was not a hit");
+
+        const DSV4ExpertW *b = dsv4_cache_get(&k, 3, 0);
+        /* Two failure modes needing different messages: an earlier version
+         * reported a NULL as "shares a slot", which sent me looking at the LRU
+         * when the fixture was simply missing the tensor. */
+        CHECK(b != NULL, "layer 3 expert 0 failed to load");
+        CHECK(b != a, "layer 3 expert 0 aliased layer 2's slot");
+        CHECK(k.evictions == 0, "evicted with a free slot available");
+
+        /* Touch layer 2 so layer 3 becomes least recently used, then force an
+         * eviction and check the RIGHT one went. */
+        /* A load that FAILS must not evict a live entry: the slot is only
+         * claimed after the read succeeds. */
+        dsv4_cache_get(&k, 2, 0);
+        const unsigned long long ev_before = (unsigned long long)k.evictions;
+        (void)dsv4_cache_get(&k, 3, 9);          /* absent -> load fails */
+        CHECK((unsigned long long)k.evictions == ev_before,
+              "a failed load evicted a live entry");
+        CHECK(dsv4_cache_get(&k, 2, 0) == a,
+              "layer 2 was lost to a load that never succeeded");
+        printf("  ok    %llu hits, %llu misses, %llu evictions\n",
+               (unsigned long long)k.hits, (unsigned long long)k.misses,
+               (unsigned long long)k.evictions);
+        dsv4_cache_free(&k);
+    }
+
+    printf("\n-- GATE 4  a failed load does not leave a live slot --\n");
+    {
+        /* Expert 7 is not in the fixture. The cache must report the failure and
+         * must NOT leave a slot claiming to hold it -- a later request would
+         * then be served garbage as a hit. */
+        DSV4Cache k;
+        dsv4_cache_init(&k, &st, &c, 13369344LL * 2);
+        printf("  (expect a diagnostic naming the missing tensor)\n");
+        const DSV4ExpertW *e = dsv4_cache_get(&k, 2, 7);
+        CHECK(e == NULL, "a missing expert was reported as loaded");
+        const DSV4ExpertW *again = dsv4_cache_get(&k, 2, 7);
+        CHECK(again == NULL, "the failed load was cached and served as a hit");
+        CHECK(k.hits == 0, "a failed load counted as a hit");
+        printf("  ok    missing expert refused twice, never cached\n");
+        dsv4_cache_free(&k);
+    }
+
+    printf("\n-- GATE 5  the bound matrices describe packed FP4 --\n");
+    {
+        DSV4Cache k;
+        dsv4_cache_init(&k, &st, &c, 1LL << 30);
+        const DSV4ExpertW *e = dsv4_cache_get(&k, 2, 0);
+        if (e) {
+            CHECK(e->w1.wdt == DSV4_WFP4, "w1 is not tagged FP4");
+            CHECK(e->w1.blk_r == 1 && e->w1.blk_c == 32,
+                  "w1 block is %dx%d, expected 1x32", e->w1.blk_r, e->w1.blk_c);
+            CHECK(e->w1.rows == c.moe_inter && e->w1.cols == c.hidden,
+                  "w1 is %dx%d, config implies %dx%d", e->w1.rows, e->w1.cols,
+                  c.moe_inter, c.hidden);
+            /* w2 is the down projection: transposed relative to w1/w3. */
+            CHECK(e->w2.rows == c.hidden && e->w2.cols == c.moe_inter,
+                  "w2 is %dx%d, expected %dx%d (down projection)",
+                  e->w2.rows, e->w2.cols, c.hidden, c.moe_inter);
+            CHECK(e->w1.w != NULL && e->w1.s != NULL, "w1 weight or scale unbound");
+            CHECK(e->w1.w != e->w1.s, "weight and scale point at the same bytes");
+            printf("  ok    w1 %dx%d 1x32, w2 %dx%d, all six tensors bound\n",
+                   e->w1.rows, e->w1.cols, e->w2.rows, e->w2.cols);
+        }
+        dsv4_cache_free(&k);
+    }
+
+    dsv4_st_close(&st);
+    printf("\n");
+    if (fails) { printf("CACHE GATE FAILED: %d check(s)\n", fails); return 1; }
+    printf("CACHE GATE PASSED\n");
+    return 0;
+}

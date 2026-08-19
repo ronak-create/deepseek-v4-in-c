@@ -119,6 +119,15 @@ TENSORS = [
     ("layers.3.ffn.shared_experts.w3.weight",       "F8_E4M3", [2048, 4096]),
     ("layers.3.ffn.shared_experts.w3.scale",        "F8_E8M0", [16, 32]),
     ("layers.3.ffn_norm.weight",                    "BF16",    [4096]),
+    # A routed expert on a SECOND layer, so the cache gate can hold two distinct
+    # entries and observe eviction order. One expert per layer is enough: the
+    # cache keys on (layer, expert) and never on tensor content.
+    ("layers.3.ffn.experts.0.w1.weight",            "I8",      [2048, 2048]),
+    ("layers.3.ffn.experts.0.w1.scale",             "F8_E8M0", [2048, 128]),
+    ("layers.3.ffn.experts.0.w2.weight",            "I8",      [4096, 1024]),
+    ("layers.3.ffn.experts.0.w2.scale",             "F8_E8M0", [4096, 64]),
+    ("layers.3.ffn.experts.0.w3.weight",            "I8",      [2048, 2048]),
+    ("layers.3.ffn.experts.0.w3.scale",             "F8_E8M0", [2048, 128]),
 ]
 
 ELEMSIZE = {
