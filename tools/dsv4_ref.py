@@ -216,3 +216,84 @@ def compress_pool(kv_state, score_state):
     The softmax runs over the SLOT axis, independently for every channel.
     """
     return (kv_state.float() * score_state.float().softmax(dim=0)).sum(dim=0)
+
+
+# ==================================================================== block ==
+# model.py Block.forward / Attention.forward / MoE.forward, decode path,
+# compress_ratio 0 (no compressor, no indexer).
+#
+# Weights are bfloat16 so the C sees byte-identical values: the fixture carries
+# the raw bf16 bit patterns and both sides widen them the same way. Anything
+# else would compare two different models.
+
+def attention_dense(x, W, cfg, kv_cache, fc, pos):
+    """One token through a compress_ratio 0 attention block."""
+    hd, rd, H = cfg["head_dim"], cfg["qk_rope"], cfg["n_heads"]
+    eps = cfg["rms_eps"]
+
+    qr = rmsnorm(x @ W["wq_a"].T.float(), W["q_norm"], eps)
+    q = (qr @ W["wq_b"].T.float()).reshape(H, hd)
+    # SECOND normalisation, per head and UNWEIGHTED -- not q_norm again.
+    q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+    q = torch.cat([q[:, :hd - rd], apply_rope(q[:, hd - rd:], fc[pos])], dim=-1)
+
+    kv = rmsnorm(x @ W["wkv"].T.float(), W["kv_norm"], eps)
+    kv = torch.cat([kv[:hd - rd], apply_rope(kv[hd - rd:], fc[pos])], dim=-1)
+    kv_cache[pos % cfg["window"]] = kv
+
+    n = min(pos + 1, cfg["window"])
+    idxs = torch.tensor([(pos - k) % cfg["window"] for k in range(n)]
+                        + [-1] * (cfg["window"] - n), dtype=torch.long)
+    o = sparse_attn(q, kv_cache, W["sink"], idxs, hd ** -0.5)
+
+    # de-rotate, then the GROUPED low-rank output projection
+    o = torch.cat([o[:, :hd - rd],
+                   apply_rope(o[:, hd - rd:], fc[pos], inverse=True)], dim=-1)
+    g, gr = cfg["o_groups"], cfg["o_lora"]
+    gw = H * hd // g
+    o = o.reshape(g, gw)
+    wo_a = W["wo_a"].float().reshape(g, gr, gw)
+    o = torch.einsum("gd,grd->gr", o, wo_a).reshape(-1)
+    return o @ W["wo_b"].T.float()
+
+
+def moe_dense(x, W, cfg, token_id):
+    """One token through the MoE half. The shared expert is added UNWEIGHTED
+    after the routed sum."""
+    logits = (x.unsqueeze(0) @ W["gate"].T.float())
+    w, idx = route(logits, W.get("gate_bias"), W.get("tid2eid"),
+                   torch.tensor([token_id]), cfg["topk"], cfg["route_scale"])
+    y = torch.zeros(cfg["hidden"])
+    for k in range(cfg["topk"]):
+        e = int(idx[0, k])
+        g_ = x @ W[f"e{e}_w1"].T.float()
+        u_ = x @ W[f"e{e}_w3"].T.float()
+        y = y + float(w[0, k]) * (swiglu(g_, u_, cfg["swiglu_limit"])
+                                  @ W[f"e{e}_w2"].T.float())
+    gs = x @ W["sh_w1"].T.float()
+    us = x @ W["sh_w3"].T.float()
+    y = y + swiglu(gs, us, cfg["swiglu_limit"]) @ W["sh_w2"].T.float()
+    return y
+
+
+def block_dense(h, W, cfg, kv_cache, fc, pos, token_id):
+    """model.py Block.forward. h is [hc, hidden].
+
+    Note the SECOND residual is taken after the attention half, not at the top.
+    """
+    hc, d = cfg["hc_mult"], cfg["hidden"]
+    it, ne, he = cfg["sinkhorn_iters"], cfg["rms_eps"], cfg["hc_eps"]
+
+    residual = h
+    x, post, comb = hc_pre(h, W["hc_attn_fn"].float(), W["hc_attn_scale"],
+                           W["hc_attn_base"], hc, ne, he, it)
+    x = rmsnorm(x, W["attn_norm"], ne)
+    x = attention_dense(x, W, cfg, kv_cache, fc, pos)
+    h = hc_post(x, residual, post, comb, hc)
+
+    residual = h
+    x, post, comb = hc_pre(h, W["hc_ffn_fn"].float(), W["hc_ffn_scale"],
+                           W["hc_ffn_base"], hc, ne, he, it)
+    x = rmsnorm(x, W["ffn_norm"], ne)
+    x = moe_dense(x, W, cfg, token_id)
+    return hc_post(x, residual, post, comb, hc)

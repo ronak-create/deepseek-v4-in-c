@@ -12,6 +12,8 @@ typedef struct {
     float *x1, *resid, *post, *comb, *mixes;
     float *qr, *q, *kv, *o, *ogrp;
     float *gate_scores, *gate_orig, *expert_gate, *expert_up, *expert_out;
+    float *expert_acc;   /* one expert's hidden-width output; MUST NOT
+                          * alias the MoE input -- see dsv4_layer.c */
     float *attn_scratch;
     int   *idxs;
     int    topk_idx[DSV4_MAX_TOPK];

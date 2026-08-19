@@ -88,7 +88,8 @@ int dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c)
         + (size_t)c->o_groups * (size_t)c->o_lora   /* ogrp */
         + (size_t)c->n_experts * 2                  /* gate scores + orig  */
         + inter * 3                                 /* expert gate/up/out  */
-        + nidx;                                     /* attention scratch   */
+        + nidx                                      /* attention scratch   */
+        + d;                                        /* expert_acc          */
 
     /* qr must hold max(q_lora, hidden): it carries the q latent and is reused
      * for the block's hidden-width output. Sizing it to q_lora alone overflows
@@ -116,6 +117,7 @@ int dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c)
     s->expert_up = p;    p += inter;
     s->expert_out = p;   p += inter;
     s->attn_scratch = p; p += nidx;
+    s->expert_acc = p;   p += d;
 
     s->idxs = (int *)calloc(nidx, sizeof(int));
     if (!s->idxs) { free(a); s->arena = NULL; return -1; }
@@ -180,12 +182,30 @@ static void attention(float *out, const float *x, const DSV4LayerW *w,
 
     const int gw = H * hd / c->o_groups;       /* channels per group  */
     const int gr = c->o_lora;                  /* rank per group      */
+    /* Stored bytes per weight for this matrix. BF16 is two, FP8 and packed FP4
+     * are one -- and for FP4 a row is only cols/2 bytes wide.
+     *
+     * This is not incidental. The first version advanced the slice pointer by
+     * g*gr*gw BYTES regardless of dtype, which is correct only for a 1-byte
+     * format. With BF16 weights every group after the first read from halfway
+     * into the wrong rows. Per-kernel gates cannot see it: every matmul was
+     * right, the caller handed one of them the wrong pointer. The whole-block
+     * oracle caught it at 14% divergence on the very first token. */
+    const size_t esz = (w->attn.wo_a.wdt == DSV4_WBF16) ? 2u : 1u;
+    const size_t row_bytes = (w->attn.wo_a.wdt == DSV4_WFP4)
+                           ? (size_t)gw / 2u : (size_t)gw * esz;
     for (int g = 0; g < c->o_groups; g++) {
         DSV4QMat slice = w->attn.wo_a;
         /* wo_a is [o_groups*o_lora][gw]; group g owns rows [g*gr, (g+1)*gr). */
         slice.rows = gr;
         slice.cols = gw;
-        slice.w = (const char *)w->attn.wo_a.w + (size_t)g * gr * gw;
+        slice.w = (const unsigned char *)w->attn.wo_a.w + (size_t)g * gr * row_bytes;
+        if (slice.s) {
+            /* The scale grid is sliced the same way, in scale-grid rows. */
+            const size_t sc_row = (size_t)((gw + slice.blk_c - 1) / slice.blk_c);
+            slice.s = (const unsigned char *)w->attn.wo_a.s
+                    + (size_t)g * (size_t)(gr / (slice.blk_r ? slice.blk_r : 1)) * sc_row;
+        }
         dsv4_mmq(s->ogrp + (size_t)g * gr, s->o + (size_t)g * gw, &slice);
     }
     dsv4_mmq(out, s->ogrp, &w->attn.wo_b);
@@ -203,18 +223,26 @@ static void moe(float *out, const float *x, const DSV4LayerW *w,
 
     for (int i = 0; i < c->hidden; i++) out[i] = 0.0f;
 
+    /* expert_acc, NOT x1. x1 IS the MoE input `x` at every call site, so
+     * writing an expert's output there corrupts the input for every expert
+     * after the first and for the shared expert too.
+     *
+     * That was a live bug. Per-kernel gates could not see it: every matmul and
+     * every activation was correct, and the caller handed one of them a buffer
+     * that aliased its own input. The whole-block oracle caught it. */
     for (int k = 0; k < c->topk; k++) {
         const DSV4ExpertW *e = src->get(src->ctx, layer, s->topk_idx[k]);
         if (!e) continue;                    /* caller-reported; see header */
-        expert_forward(s->x1, x, e, s, c->hidden, c->moe_inter, c->swiglu_limit);
+        expert_forward(s->expert_acc, x, e, s, c->hidden, c->moe_inter,
+                       c->swiglu_limit);
         const float wk = s->topk_w[k];
-        for (int i = 0; i < c->hidden; i++) out[i] += wk * s->x1[i];
+        for (int i = 0; i < c->hidden; i++) out[i] += wk * s->expert_acc[i];
     }
 
     /* The shared expert is added UNWEIGHTED, after the routed sum. */
-    expert_forward(s->x1, x, &w->moe.shared, s, c->hidden,
+    expert_forward(s->expert_acc, x, &w->moe.shared, s, c->hidden,
                    c->moe_inter * c->n_shared, c->swiglu_limit);
-    for (int i = 0; i < c->hidden; i++) out[i] += s->x1[i];
+    for (int i = 0; i < c->hidden; i++) out[i] += s->expert_acc[i];
 }
 
 /* One decoder layer. `h` is [hc_mult][hidden] in and out. */

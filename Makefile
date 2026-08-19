@@ -17,7 +17,7 @@ BIN   := bin
 
 .PHONY: all test cfg-fixtures st-fixtures fixtures clean help
 
-all: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress $(BIN)/test_indexer $(BIN)/test_layer $(BIN)/test_cache $(BIN)/test_bindmem $(BIN)/test_oracle
+all: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress $(BIN)/test_indexer $(BIN)/test_layer $(BIN)/test_cache $(BIN)/test_bindmem $(BIN)/test_oracle $(BIN)/test_layer_oracle
 
 $(BIN)/test_cfg: tests/unit/test_cfg.c include/dsv4/dsv4.h include/dsv4/dsv4_cfg.h
 	@mkdir -p $(BIN)
@@ -36,6 +36,7 @@ st-fixtures:
 	python3 tools/make_st_fixture.py tests/fixtures/st
 ref-fixtures:
 	~/venv-cuda/bin/python tools/emit_fixtures.py tests/fixtures/ref
+	~/venv-cuda/bin/python tools/emit_layer_fixture.py tests/fixtures/ref
 fixtures: cfg-fixtures st-fixtures
 
 $(BIN)/test_bind: tests/unit/test_bind.c src/model/dsv4_bind.c src/model/dsv4_bind.h                   src/io/dsv4_st.c include/dsv4/dsv4.h
@@ -92,7 +93,11 @@ $(BIN)/test_oracle: tests/unit/test_oracle.c $(DSV4_CORE) src/core/dsv4_indexer.
 	@mkdir -p $(BIN)
 	$(CC) $(CFLAGS) $(INCS) tests/unit/test_oracle.c $(DSV4_CORE) 	      src/core/dsv4_indexer.c -o $@ $(LDFLAGS)
 
-test: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress $(BIN)/test_indexer $(BIN)/test_layer $(BIN)/test_cache $(BIN)/test_bindmem $(BIN)/test_oracle
+$(BIN)/test_layer_oracle: tests/unit/test_layer_oracle.c src/model/dsv4_layer.c                           $(DSV4_CORE) src/model/dsv4_layer.h third_party/json.h
+	@mkdir -p $(BIN)
+	$(CC) $(CFLAGS) $(INCS) tests/unit/test_layer_oracle.c src/model/dsv4_layer.c 	      $(DSV4_CORE) -o $@ $(LDFLAGS)
+
+test: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress $(BIN)/test_indexer $(BIN)/test_layer $(BIN)/test_cache $(BIN)/test_bindmem $(BIN)/test_oracle $(BIN)/test_layer_oracle
 	@./$(BIN)/test_cfg
 	@echo
 	@./$(BIN)/test_st
@@ -122,6 +127,8 @@ test: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/t
 	@./$(BIN)/test_bindmem
 	@echo
 	@./$(BIN)/test_oracle
+	@echo
+	@./$(BIN)/test_layer_oracle
 
 clean:
 	rm -rf $(BUILD) $(BIN)
