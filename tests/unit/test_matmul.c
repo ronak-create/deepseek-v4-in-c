@@ -34,6 +34,14 @@ void dsv4_matmul_fp4(float *, const float *, const uint8_t *, const uint8_t *,
                      int, int, int, int);
 void dsv4_mmq(float *, const float *, const DSV4QMat *);
 
+/* Both instantiations, so the gate can run them against each other. */
+void dsv4_matmul_bf16_scalar(float *, const float *, const uint16_t *, int, int);
+void dsv4_matmul_fp8_scalar(float *, const float *, const uint8_t *,
+                            const uint8_t *, int, int, int, int);
+void dsv4_matmul_fp4_scalar(float *, const float *, const uint8_t *,
+                            const uint8_t *, int, int, int, int);
+int  dsv4_matmul_has_avx2(void);
+
 static int fails = 0;
 #define CHECK(cond, ...) do {                                                  \
     if (!(cond)) { printf("  FAIL  "); printf(__VA_ARGS__); printf("\n");      \
@@ -238,6 +246,74 @@ int main(void)
     }
 
     printf("\n");
+    printf("\n-- GATE  the AVX2 path is BITWISE the scalar path --\n");
+    {
+        /* The whole file is arranged around one property: a faster kernel must
+         * not be a different kernel. So this compares exact bit patterns, not
+         * a tolerance. A tolerance here would defeat the purpose -- "close" is
+         * precisely the failure mode -ffp-contract=off exists to prevent.
+         *
+         * Sizes are deliberately not multiples of the vector width in the
+         * output dimension, and the FP8 block width 128 and FP4 block width 32
+         * both exercise the 16-wide main loop plus the scalar tail. */
+        enum { IN = 256, OUT = 37 };
+        static float x[IN], ys[OUT], yv[OUT];
+        static uint8_t W8[(size_t)OUT * IN], W4[(size_t)OUT * IN / 2];
+        static uint16_t Wb[(size_t)OUT * IN];
+        static uint8_t S8[OUT * 2], S4[(size_t)OUT * (IN / 32)];
+
+        unsigned r = 12345u;
+        for (int i = 0; i < IN; i++) {
+            r = r * 1103515245u + 12345u;
+            x[i] = (float)((int)((r >> 16) & 0xffff) - 32768) * 1e-3f;
+        }
+        /* e4m3fn: 0x7F and 0xFF are the only NaNs. Excluded on purpose --
+         * a NaN makes both paths produce a NaN whose payload need not have the
+         * same bits, so the comparison would fail on the data rather than on
+         * the arithmetic. That is exactly what the first run of this gate did,
+         * and fp4 passed alongside it because all 16 e2m1 codes are finite. */
+        for (size_t i = 0; i < sizeof W8; i++) {
+            r = r * 1103515245u + 12345u;
+            uint8_t b = (uint8_t)(r >> 16);
+            if ((b & 0x7Fu) == 0x7Fu) b &= 0xFEu;
+            W8[i] = b;
+        }
+        for (size_t i = 0; i < sizeof W4; i++) { r = r * 1103515245u + 12345u;
+                                                 W4[i] = (uint8_t)(r >> 16); }
+        /* bf16 is the top half of an f32, so build it from a finite float
+         * rather than from random bits, which would land on NaN and inf. */
+        for (size_t i = 0; i < (size_t)OUT * IN; i++) {
+            r = r * 1103515245u + 12345u;
+            union { uint32_t u; float f; } v;
+            v.f = (float)((int)((r >> 16) & 0xffff) - 32768) * 1e-3f;
+            Wb[i] = (uint16_t)(v.u >> 16);
+        }
+        /* Keep scales in a sane exponent range so nothing overflows to inf --
+         * an inf == inf comparison would pass while hiding a real difference. */
+        for (size_t i = 0; i < sizeof S8; i++) S8[i] = 127;
+        for (size_t i = 0; i < sizeof S4; i++) S4[i] = 127;
+
+        printf("  build has AVX2+FMA: %s\n",
+               dsv4_matmul_has_avx2() ? "yes" : "no (paths are the same code)");
+
+        dsv4_matmul_bf16_scalar(ys, x, Wb, IN, OUT);
+        dsv4_matmul_bf16(yv, x, Wb, IN, OUT);
+        CHECK(memcmp(ys, yv, sizeof ys) == 0, "bf16 differs between paths");
+
+        dsv4_matmul_fp8_scalar(ys, x, W8, S8, IN, OUT, 128, 128);
+        dsv4_matmul_fp8(yv, x, W8, S8, IN, OUT, 128, 128);
+        CHECK(memcmp(ys, yv, sizeof ys) == 0, "fp8 differs between paths");
+
+        dsv4_matmul_fp4_scalar(ys, x, W4, S4, IN, OUT, 1, 32);
+        dsv4_matmul_fp4(yv, x, W4, S4, IN, OUT, 1, 32);
+        CHECK(memcmp(ys, yv, sizeof ys) == 0, "fp4 differs between paths");
+
+        if (!fails)
+            printf("  ok    bf16, fp8 and fp4 identical to the last bit over "
+                   "%d x %d\n", OUT, IN);
+    }
+
+
     if (fails) { printf("MATMUL GATE FAILED: %d check(s)\n", fails); return 1; }
     printf("MATMUL GATE PASSED\n");
     return 0;

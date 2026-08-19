@@ -46,7 +46,7 @@
 /* One block's dot product, in the same 16-accumulator tree K3 uses. `n` is the
  * block width, always a multiple of 16 for the real geometries (32 and 128), so
  * the tail loop only runs on the hand-built fixtures. */
-#define BLOCK_DOT(LOAD)                                                        \
+#define BLOCK_DOT_S(LOAD)                                                      \
     do {                                                                       \
         double a[16] = {0};                                                    \
         int i = 0;                                                             \
@@ -61,7 +61,47 @@
         for (; i < n; i++) acc = fma(LOAD(i), (double)xb[i], acc);             \
     } while (0)
 
-/* ------------------------------------------------------------------ bf16 --- */
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+
+/* THE SAME TREE, FOUR LANES AT A TIME -- and it is the same tree, not merely a
+ * similar one. Put a[0..3] in v0, a[4..7] in v1, a[8..11] in v2, a[12..15] in
+ * v3, and lane j of each vector holds a[j], a[4+j], a[8+j], a[12+j]. Then
+ *
+ *     b[j] = (a[j] + a[4+j]) + (a[8+j] + a[12+j])
+ *
+ * is exactly (v0 + v1) + (v2 + v3), elementwise, with the same grouping. The
+ * final (b0 + b1) + (b2 + b3) is then done on the four extracted lanes in the
+ * scalar order. _mm256_fmadd_pd is the same IEEE fused multiply-add as fma(),
+ * and float -> double is exact, so every intermediate is bit-for-bit what the
+ * scalar path computes. That is a claim the matmul gate checks at runtime
+ * rather than a claim this comment makes.
+ *
+ * LOAD4(i) must return the four weights at logical columns i..i+3 as doubles. */
+#define XB4(i) _mm256_cvtps_pd(_mm_loadu_ps(xb + (i)))
+#define BLOCK_DOT_V(LOAD1, LOAD4)                                              \
+    do {                                                                       \
+        __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();            \
+        __m256d v2 = _mm256_setzero_pd(), v3 = _mm256_setzero_pd();            \
+        int i = 0;                                                             \
+        for (; i + 15 < n; i += 16) {                                          \
+            v0 = _mm256_fmadd_pd(LOAD4(i),      XB4(i),      v0);              \
+            v1 = _mm256_fmadd_pd(LOAD4(i + 4),  XB4(i + 4),  v1);              \
+            v2 = _mm256_fmadd_pd(LOAD4(i + 8),  XB4(i + 8),  v2);              \
+            v3 = _mm256_fmadd_pd(LOAD4(i + 12), XB4(i + 12), v3);              \
+        }                                                                      \
+        double bb[4];                                                          \
+        _mm256_storeu_pd(bb, _mm256_add_pd(_mm256_add_pd(v0, v1),              \
+                                           _mm256_add_pd(v2, v3)));            \
+        acc = (bb[0] + bb[1]) + (bb[2] + bb[3]);                               \
+        for (; i < n; i++) acc = fma(LOAD1(i), (double)xb[i], acc);            \
+    } while (0)
+#endif
+
+/* --------------------------------------------------------------- loaders ---
+ * One per storage format, in two widths. The scalar width is the definition;
+ * the 4-wide one must agree with it element for element, which the matmul gate
+ * checks rather than assumes. */
 
 static inline double bf16d(uint16_t h)
 {
@@ -70,85 +110,153 @@ static inline double bf16d(uint16_t h)
     return (double)v.f;
 }
 
+#define LOAD1_BF16(k) bf16d(row[k])
+#define LOAD1_FP8(k)  ((double)dsv4_e4m3_to_f32(wb[k]))
+#define LOAD1_FP4(k)  ((double)dsv4_fp4_at(row, (int64_t)c0 + (k)))
+
+#if defined(__AVX2__) && defined(__FMA__)
+/* BF16 widens without a table: the stored halfword IS the top half of the f32,
+ * so shifting it up 16 bits and reinterpreting is the whole conversion. */
+static inline __m256d load4_bf16(const uint16_t *row, int i)
+{
+    const __m128i h = _mm_loadl_epi64((const __m128i *)(row + i));
+    const __m128i w = _mm_slli_epi32(_mm_cvtepu16_epi32(h), 16);
+    return _mm256_cvtps_pd(_mm_castsi128_ps(w));
+}
+
+/* FP8 and FP4 keep their scalar table lookups -- there are 256 and 16 possible
+ * values and a gather would cost more than four L1 hits. What the vector form
+ * buys is the arithmetic: one fmadd instead of four, on operands that were
+ * being widened to double one at a time. */
+static inline __m256d load4_fp8(const uint8_t *wb, int i)
+{
+    /* _mm_set_ps, NOT a stack array reloaded with _mm_loadu_ps. Four scalar
+     * stores followed by one 128-bit load is a store-to-load forwarding stall,
+     * and it cost more than the vector arithmetic saved: the first version of
+     * this file measured the expert matmuls at 41.8 s against the scalar
+     * path's 27.7 s. */
+    return _mm256_cvtps_pd(_mm_set_ps(dsv4_e4m3_to_f32(wb[i + 3]),
+                                      dsv4_e4m3_to_f32(wb[i + 2]),
+                                      dsv4_e4m3_to_f32(wb[i + 1]),
+                                      dsv4_e4m3_to_f32(wb[i + 0])));
+}
+
+static inline __m256d load4_fp4(const uint8_t *row, int64_t base, int i)
+{
+    return _mm256_cvtps_pd(_mm_set_ps(dsv4_fp4_at(row, base + i + 3),
+                                      dsv4_fp4_at(row, base + i + 2),
+                                      dsv4_fp4_at(row, base + i + 1),
+                                      dsv4_fp4_at(row, base + i + 0)));
+}
+
+#define LOAD4_BF16(k) load4_bf16(row, (k))
+#define LOAD4_FP8(k)  load4_fp8(wb, (k))
+#define LOAD4_FP4(k)  load4_fp4(row, (int64_t)c0, (k))
+#else
+/* Never expanded without AVX2, but they must still parse. */
+#define LOAD4_BF16(k) 0
+#define LOAD4_FP8(k)  0
+#define LOAD4_FP4(k)  0
+#endif
+
+/* The scalar tree, called with the vector signature so one body serves both. */
+#define BLOCK_DOT_S2(LOAD1, LOAD4) BLOCK_DOT_S(LOAD1)
+
+/* ---------------------------------------------------------------- kernels ---
+ * Emitted twice: once always, as `..._scalar`, and once as `..._avx2` where the
+ * machine has AVX2+FMA. Two instantiations of ONE body, so they cannot drift
+ * apart, and both are callable at runtime so the gate can compare them on real
+ * data instead of trusting the argument that they must agree. */
+#define GEN_MATMULS(SUF, DOT)                                                  \
+                                                                               \
+void dsv4_matmul_bf16##SUF(float *y, const float *x, const uint16_t *W,        \
+                           int in, int out)                                    \
+{                                                                              \
+    _Pragma("omp parallel for schedule(static) if (out > 64)")                 \
+    for (int o = 0; o < out; o++) {                                            \
+        const uint16_t *row = W + (size_t)o * in;                              \
+        const float *xb = x;                                                   \
+        const int n = in;                                                      \
+        double acc;                                                            \
+        DOT(LOAD1_BF16, LOAD4_BF16);                                           \
+        y[o] = (float)acc;                                                     \
+    }                                                                          \
+}                                                                              \
+                                                                               \
+void dsv4_matmul_fp8##SUF(float *y, const float *x, const uint8_t *W,          \
+                          const uint8_t *S, int in, int out,                   \
+                          int blk_r, int blk_c)                                \
+{                                                                              \
+    const int sc = (in + blk_c - 1) / blk_c;                                   \
+    _Pragma("omp parallel for schedule(static) if (out > 64)")                 \
+    for (int o = 0; o < out; o++) {                                            \
+        const uint8_t *rw = W + (size_t)o * in;                                \
+        double total = 0.0;                                                    \
+        for (int c0 = 0; c0 < in; c0 += blk_c) {                               \
+            const int n = (in - c0 < blk_c) ? (in - c0) : blk_c;               \
+            const uint8_t *wb = rw + c0;                                       \
+            const float   *xb = x + c0;                                        \
+            double acc;                                                        \
+            DOT(LOAD1_FP8, LOAD4_FP8);                                         \
+            /* One multiply per block, as kernel.py does -- not per element. */\
+            total += acc * (double)dsv4_e8m0_to_f32(                           \
+                        S[(o / blk_r) * (size_t)sc + (c0 / blk_c)]);           \
+        }                                                                      \
+        y[o] = (float)total;                                                   \
+    }                                                                          \
+}                                                                              \
+                                                                               \
+void dsv4_matmul_fp4##SUF(float *y, const float *x, const uint8_t *W,          \
+                          const uint8_t *S, int in, int out,                   \
+                          int blk_r, int blk_c)                                \
+{                                                                              \
+    const int sc = (in + blk_c - 1) / blk_c;                                   \
+    _Pragma("omp parallel for schedule(static) if (out > 64)")                 \
+    for (int o = 0; o < out; o++) {                                            \
+        /* Stored row is in/2 bytes wide. Getting this stride wrong reads half  \
+         * a row of the wrong values and still produces finite numbers. */     \
+        const uint8_t *row = W + (size_t)o * ((size_t)in / 2);                 \
+        double total = 0.0;                                                    \
+        for (int c0 = 0; c0 < in; c0 += blk_c) {                               \
+            const int n = (in - c0 < blk_c) ? (in - c0) : blk_c;               \
+            const float *xb = x + c0;                                          \
+            double acc;                                                        \
+            DOT(LOAD1_FP4, LOAD4_FP4);                                         \
+            total += acc * (double)dsv4_e8m0_to_f32(                           \
+                        S[(o / blk_r) * (size_t)sc + (c0 / blk_c)]);           \
+        }                                                                      \
+        y[o] = (float)total;                                                   \
+    }                                                                          \
+}
+
+GEN_MATMULS(_scalar, BLOCK_DOT_S2)
+
+#if defined(__AVX2__) && defined(__FMA__)
+GEN_MATMULS(_avx2, BLOCK_DOT_V)
+#define PICK(name) name##_avx2
+int dsv4_matmul_has_avx2(void) { return 1; }
+#else
+#define PICK(name) name##_scalar
+int dsv4_matmul_has_avx2(void) { return 0; }
+#endif
+
+/* The names the rest of the engine calls. */
 void dsv4_matmul_bf16(float *y, const float *x, const uint16_t *W,
                       int in, int out)
 {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
-        const uint16_t *row = W + (size_t)o * in;
-        const float *xb = x;
-        const int n = in;
-        double acc;
-#define LOAD_BF16(k) bf16d(row[k])
-        BLOCK_DOT(LOAD_BF16);
-#undef LOAD_BF16
-        y[o] = (float)acc;
-    }
+    PICK(dsv4_matmul_bf16)(y, x, W, in, out);
 }
 
-/* ------------------------------------------------------------------- fp8 ---
- * W is [out, in] E4M3 bytes; S is the E8M0 grid, ceil(out/128) x ceil(in/128).
- * The scale changes every blk_c columns along the row. */
 void dsv4_matmul_fp8(float *y, const float *x, const uint8_t *W,
                      const uint8_t *S, int in, int out, int blk_r, int blk_c)
 {
-    const int sc = (in + blk_c - 1) / blk_c;   /* scale columns per row */
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
-        const uint8_t *row = W + (size_t)o * in;
-        double total = 0.0;
-        for (int c0 = 0; c0 < in; c0 += blk_c) {
-            const int n = (in - c0 < blk_c) ? (in - c0) : blk_c;
-            const uint8_t *wb = row + c0;
-            const float   *xb = x + c0;
-            double acc;
-#define LOAD_FP8(k) ((double)dsv4_e4m3_to_f32(wb[k]))
-            BLOCK_DOT(LOAD_FP8);
-#undef LOAD_FP8
-            /* One multiply per block, as kernel.py does -- not per element. */
-            total += acc * (double)dsv4_e8m0_to_f32(S[(o / blk_r) * (size_t)sc
-                                                      + (c0 / blk_c)]);
-        }
-        y[o] = (float)total;
-    }
+    PICK(dsv4_matmul_fp8)(y, x, W, S, in, out, blk_r, blk_c);
 }
 
-/* ------------------------------------------------------------------- fp4 ---
- * W is [out, in/2] BYTES holding two E2M1 values each, packed along in (the
- * reduce dimension). S is the E8M0 grid, out x (in/32).
- *
- * NOTE the element index into a packed row is the LOGICAL column, and
- * dsv4_fp4_at does the byte/nibble split. Whether the even element is the low
- * or the high nibble is the one unverified thing in this path -- see
- * DSV4_FP4_LOW_NIBBLE_FIRST in dsv4_quant.h. */
 void dsv4_matmul_fp4(float *y, const float *x, const uint8_t *W,
                      const uint8_t *S, int in, int out, int blk_r, int blk_c)
 {
-    const int sc = (in + blk_c - 1) / blk_c;
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (out > 64)
-#endif
-    for (int o = 0; o < out; o++) {
-        /* Stored row is in/2 bytes wide. Getting this stride wrong reads half a
-         * row of the wrong values and still produces finite numbers. */
-        const uint8_t *row = W + (size_t)o * ((size_t)in / 2);
-        double total = 0.0;
-        for (int c0 = 0; c0 < in; c0 += blk_c) {
-            const int n = (in - c0 < blk_c) ? (in - c0) : blk_c;
-            const float *xb = x + c0;
-            double acc;
-#define LOAD_FP4(k) ((double)dsv4_fp4_at(row, (int64_t)c0 + (k)))
-            BLOCK_DOT(LOAD_FP4);
-#undef LOAD_FP4
-            total += acc * (double)dsv4_e8m0_to_f32(S[(o / blk_r) * (size_t)sc
-                                                      + (c0 / blk_c)]);
-        }
-        y[o] = (float)total;
-    }
+    PICK(dsv4_matmul_fp4)(y, x, W, S, in, out, blk_r, blk_c);
 }
 
 /* ---------------------------------------------------------------- dispatch --
