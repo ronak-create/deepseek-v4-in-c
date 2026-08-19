@@ -5,3 +5,4 @@ __pycache__/
 tests/fixtures/st/
 tests/fixtures/st_bad/
 tests/fixtures/ref/
+tests/fixtures/tok/
