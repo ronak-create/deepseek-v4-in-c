@@ -154,8 +154,12 @@ static int match_stage2(const char *s, int n, int i, int *blen)
             cnt++; m = t3; last = t3;
         }
         if (cnt > 0) {
-            while (last < n) { int t3 = last; uint32_t e = dsv4_utf8_next(s, n, &t3);
-                               if (e != '\r' && e != '\n') break; last = t3; }
+            while (last < n) {
+                int t3 = last;
+                uint32_t e = dsv4_utf8_next(s, n, &t3);
+                if (e != '\r' && e != '\n') break;
+                last = t3;
+            }
             *blen = last - i; return 1;
         }
     }
@@ -170,13 +174,20 @@ static int match_stage2(const char *s, int n, int i, int *blen)
         }
         /* back off to the first \r\n inside that whitespace run */
         int m = i, nl_start = -1;
-        while (m < k) { int t2 = m; uint32_t e = dsv4_utf8_next(s, n, &t2);
-                        if (e == '\r' || e == '\n') { nl_start = m; break; }
-                        m = t2; }
+        while (m < k) {
+            int t2 = m;
+            uint32_t e = dsv4_utf8_next(s, n, &t2);
+            if (e == '\r' || e == '\n') { nl_start = m; break; }
+            m = t2;
+        }
         if (nl_start >= 0) {
             int e2 = nl_start;
-            while (e2 < n) { int t2 = e2; uint32_t e = dsv4_utf8_next(s, n, &t2);
-                             if (e != '\r' && e != '\n') break; e2 = t2; }
+            while (e2 < n) {
+                int t2 = e2;
+                uint32_t e = dsv4_utf8_next(s, n, &t2);
+                if (e != '\r' && e != '\n') break;
+                e2 = t2;
+            }
             *blen = e2 - i; return 1;
         }
         (void)last_ws;
