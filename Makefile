@@ -17,7 +17,7 @@ BIN   := bin
 
 .PHONY: all test cfg-fixtures st-fixtures fixtures clean help
 
-all: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress
+all: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress $(BIN)/test_indexer
 
 $(BIN)/test_cfg: tests/unit/test_cfg.c include/dsv4/dsv4.h include/dsv4/dsv4_cfg.h
 	@mkdir -p $(BIN)
@@ -68,7 +68,11 @@ $(BIN)/test_compress: tests/unit/test_compress.c src/core/dsv4_compress.c includ
 	@mkdir -p $(BIN)
 	$(CC) $(CFLAGS) $(INCS) tests/unit/test_compress.c src/core/dsv4_compress.c -o $@ $(LDFLAGS)
 
-test: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress
+$(BIN)/test_indexer: tests/unit/test_indexer.c src/core/dsv4_indexer.c include/dsv4/dsv4.h
+	@mkdir -p $(BIN)
+	$(CC) $(CFLAGS) $(INCS) tests/unit/test_indexer.c src/core/dsv4_indexer.c -o $@ $(LDFLAGS)
+
+test: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress $(BIN)/test_indexer
 	@./$(BIN)/test_cfg
 	@echo
 	@./$(BIN)/test_st
@@ -88,6 +92,8 @@ test: $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/t
 	@./$(BIN)/test_attn
 	@echo
 	@./$(BIN)/test_compress
+	@echo
+	@./$(BIN)/test_indexer
 
 clean:
 	rm -rf $(BUILD) $(BIN)
