@@ -75,6 +75,22 @@ int dsv4_cache_init(DSV4Cache *c, const DSV4St *st, const DSV4Cfg *cfg,
         return -1;
     }
 
+    /* The largest coalesced run is the three weights; the widened window can
+     * overhang by up to one alignment unit at each end. */
+    int64_t widest_run = 0;
+    for (int i = 0; i < 3; i++) widest_run += c->len_w[i];
+    c->bounce_cap = widest_run + 2 * 4096;
+    if (posix_memalign((void **)&c->bounce, 4096, (size_t)c->bounce_cap) != 0) {
+        fprintf(stderr, "dsv4_cache: could not allocate a %lld byte staging "
+                        "buffer\n", (long long)c->bounce_cap);
+        return -1;
+    }
+    c->direct = (st->dfd && st->nshard > 0 && st->dfd[0] >= 0);
+    if (!c->direct)
+        fprintf(stderr, "dsv4_cache: O_DIRECT unavailable; expert reads go "
+                        "through the page cache, which at a 148 GB working set "
+                        "evicts more than it saves\n");
+
     c->nslot = (int)(budget_bytes / c->expert_bytes);
     c->slot = (DSV4Slot *)calloc((size_t)c->nslot, sizeof(DSV4Slot));
     if (!c->slot) return -1;
@@ -93,6 +109,7 @@ void dsv4_cache_free(DSV4Cache *c)
     if (!c || !c->slot) return;
     for (int i = 0; i < c->nslot; i++) free(c->slot[i].bytes);
     free(c->slot);
+    free(c->bounce);
     memset(c, 0, sizeof *c);
 }
 
@@ -187,12 +204,28 @@ static int load_expert(DSV4Cache *c, DSV4Slot *s, const DSV4Tensor *t[6])
         int64_t len = 0;
         for (int k = i; k <= j; k++) len += r[k].len;
 
-        int64_t got = 0;
-        while (got < len) {
-            const ssize_t n = pread(c->st->fd[r[i].shard], s->bytes + r[i].soff + got,
-                                    (size_t)(len - got), (off_t)(r[i].foff + got));
-            if (n <= 0) return -1;
-            got += n;
+        /* O_DIRECT through the staging buffer. The page cache is not merely
+         * unhelpful for these reads, it is harmful: a 148 GB expert working set
+         * cannot be cached in 23 GB, so every buffered read evicts pages that
+         * WOULD have been reused to hold 12 MB that will not be. Measured cold:
+         * 1.00 GB/s buffered against 4.4 GB/s raw O_DIRECT on this disk. */
+        if (c->direct && len <= c->bounce_cap - 2 * 4096) {
+            int64_t poff = 0;
+            const int64_t n = dsv4_st_read_aligned(c->st, r[i].shard, r[i].foff,
+                                                   len, c->bounce, c->bounce_cap,
+                                                   &poff);
+            if (n != len) return -1;
+            memcpy(s->bytes + r[i].soff, c->bounce + poff, (size_t)len);
+        } else {
+            int64_t got = 0;
+            while (got < len) {
+                const ssize_t n = pread(c->st->fd[r[i].shard],
+                                        s->bytes + r[i].soff + got,
+                                        (size_t)(len - got),
+                                        (off_t)(r[i].foff + got));
+                if (n <= 0) return -1;
+                got += n;
+            }
         }
         c->bytes_read += (uint64_t)len;
         i = j + 1;

@@ -54,6 +54,21 @@ typedef struct {
     int64_t  off_w[3], off_s[3];
     int64_t  len_w[3], len_s[3];
 
+    /* One 4096-aligned staging buffer for O_DIRECT reads.
+     *
+     * O_DIRECT needs the offset, the length AND the buffer all aligned, so a
+     * read is widened outward to the enclosing window and the payload starts
+     * somewhere inside it. The slot cannot receive that directly -- its run
+     * offsets are not aligned -- so the window lands here and the payload is
+     * copied across. One 12 MB memcpy at ~10 GB/s costs ~1 ms against the ~10 ms
+     * the unbuffered read saves.
+     *
+     * NOT thread-safe: one buffer per cache. If expert loads are ever issued
+     * concurrently this must become per-thread. */
+    unsigned char *bounce;
+    int64_t        bounce_cap;
+    int            direct;      /* 1 when the shards opened O_DIRECT */
+
     /* stats */
     uint64_t hits, misses, evictions;
     uint64_t bytes_read;
