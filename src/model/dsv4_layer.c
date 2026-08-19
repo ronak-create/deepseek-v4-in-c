@@ -1,0 +1,249 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* dsv4_layer.c - one decoder layer, decode path.
+ *
+ * Source: model.py Block.forward, Attention.forward, MoE.forward.
+ *
+ * THE RESIDUAL STREAM IS hc_mult VECTORS WIDE, NOT ONE. Every layer boundary
+ * carries [hc_mult][hidden], and a block is
+ *
+ *     residual = x
+ *     x, post, comb = hc_pre(x, hc_attn)     hc_mult -> 1
+ *     x = attn(attn_norm(x))
+ *     x = hc_post(x, residual, post, comb)   1 -> hc_mult
+ *     residual = x
+ *     x, post, comb = hc_pre(x, hc_ffn)
+ *     x = ffn(ffn_norm(x))
+ *     x = hc_post(x, residual, post, comb)
+ *
+ * Note the SECOND residual is taken AFTER the attention half, not at the top of
+ * the block. Reusing the block's input for both halves is the obvious reading
+ * and quietly removes the attention contribution from the FFN's residual path.
+ *
+ * THREE THINGS INSIDE ATTENTION THAT ARE NOT OBVIOUS
+ *
+ * 1. q IS NORMALISED TWICE, and the second one has NO WEIGHT:
+ *        qr = q_norm(wq_a(x))                <- learned RMSNorm on q_lora
+ *        q  = wq_b(qr) -> [n_heads, head_dim]
+ *        q *= rsqrt(q.square().mean(-1) + eps)   <- per head, UNWEIGHTED
+ *    The second is easy to read as a repeat of q_norm and is not: it has no
+ *    parameter and it runs per head over head_dim, not over q_lora.
+ *
+ * 2. qr IS REUSED BY THE INDEXER. The indexer takes the pre-wq_b latent, not x
+ *    and not q, which is why it shares q_lora_rank with attention.
+ *
+ * 3. THE OUTPUT PROJECTION IS GROUPED AND LOW-RANK. o is viewed as o_groups
+ *    slices, each multiplied by its own slice of wo_a, and only then does wo_b
+ *    map back to hidden. Flattening o and applying wo_a as one matrix has the
+ *    right shapes and mixes heads that must stay in separate groups.
+ */
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "dsv4.h"
+#include "dsv4_bind.h"
+#include "dsv4_layer.h"
+
+/* Kernels this file wires together. */
+void dsv4_rmsnorm(float *, const float *, const float *, int, float);
+void dsv4_swiglu(float *, const float *, const float *, int, float);
+void dsv4_route(int *, float *, float *, float *, const float *,
+                const int64_t *, int, int, int, float);
+void dsv4_mmq(float *, const float *, const DSV4QMat *);
+void dsv4_rope_apply(float *, int, int, const float *, const float *, int, int, int);
+void dsv4_sparse_attn(float *, const float *, const float *, const float *,
+                      const int *, int, int, int, float, float *);
+int  dsv4_window_idxs(int *, int, int);
+void dsv4_hc_pre(float *, float *, float *, float *, const float *,
+                 const DSV4HcW *, int, int, int, float, float);
+void dsv4_hc_post(float *, const float *, const float *, const float *,
+                  const float *, int, int);
+
+
+
+
+/* ---------------------------------------------------------------- scratch --- */
+
+int dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c)
+{
+    memset(s, 0, sizeof *s);
+    const size_t hc    = (size_t)c->hc_mult;
+    const size_t d     = (size_t)c->hidden;
+    const size_t heads = (size_t)c->n_heads;
+    const size_t hd    = (size_t)c->head_dim;
+    const size_t inter = (size_t)c->moe_inter * (size_t)c->n_shared;
+    /* The window plus every compressed row a ratio-4 layer can select. */
+    const size_t nidx  = (size_t)c->sliding_window + (size_t)c->index_topk;
+
+    const size_t nf =
+          d                 /* x1     */
+        + hc * d            /* resid  */
+        + hc                /* post   */
+        + hc * hc           /* comb   */
+        + (2 + hc) * hc     /* mixes  */
+        + d                 /* qr (also reused as the layer output buffer) */
+        + heads * hd        /* q      */
+        + hd                /* kv     */
+        + heads * hd        /* o      */
+        + (size_t)c->o_groups * (size_t)c->o_lora   /* ogrp */
+        + (size_t)c->n_experts * 2                  /* gate scores + orig  */
+        + inter * 3                                 /* expert gate/up/out  */
+        + nidx;                                     /* attention scratch   */
+
+    /* qr must hold max(q_lora, hidden): it carries the q latent and is reused
+     * for the block's hidden-width output. Sizing it to q_lora alone overflows
+     * on any model where hidden > q_lora, which is both released ones. */
+    const size_t qr_n = (d > (size_t)c->q_lora) ? d : (size_t)c->q_lora;
+
+    float *a = (float *)calloc(nf + qr_n, sizeof(float));
+    if (!a) return -1;
+    s->arena = a;
+
+    float *p = a;
+    s->x1 = p;           p += d;
+    s->resid = p;        p += hc * d;
+    s->post = p;         p += hc;
+    s->comb = p;         p += hc * hc;
+    s->mixes = p;        p += (2 + hc) * hc;
+    s->qr = p;           p += qr_n;
+    s->q = p;            p += heads * hd;
+    s->kv = p;           p += hd;
+    s->o = p;            p += heads * hd;
+    s->ogrp = p;         p += (size_t)c->o_groups * (size_t)c->o_lora;
+    s->gate_scores = p;  p += c->n_experts;
+    s->gate_orig = p;    p += c->n_experts;
+    s->expert_gate = p;  p += inter;
+    s->expert_up = p;    p += inter;
+    s->expert_out = p;   p += inter;
+    s->attn_scratch = p; p += nidx;
+
+    s->idxs = (int *)calloc(nidx, sizeof(int));
+    if (!s->idxs) { free(a); s->arena = NULL; return -1; }
+    return 0;
+}
+
+void dsv4_scratch_free(DSV4Scratch *s)
+{
+    if (!s) return;
+    free(s->arena);
+    free(s->idxs);
+    memset(s, 0, sizeof *s);
+}
+
+/* SwiGLU expert: w2( silu(clamp(w1 x)) * clamp(w3 x) ). */
+static void expert_forward(float *out, const float *x, const DSV4ExpertW *e,
+                           DSV4Scratch *s, int hidden, int inter, float limit)
+{
+    dsv4_mmq(s->expert_gate, x, &e->w1);
+    dsv4_mmq(s->expert_up,   x, &e->w3);
+    dsv4_swiglu(s->expert_out, s->expert_gate, s->expert_up, inter, limit);
+    dsv4_mmq(out, s->expert_out, &e->w2);
+}
+
+/* Attention for one token at absolute position `pos`.
+ *
+ * kv_cache is the layer's ring: `window` rows of head_dim, followed by the
+ * compressed rows when the layer has a compressor. idxs must already hold the
+ * window slots and any compressed selections, in cache coordinates. */
+static void attention(float *out, const float *x, const DSV4LayerW *w,
+                      const DSV4Cfg *c, DSV4Scratch *s, float *kv_cache,
+                      const float *cs, const float *sn, int pos, int n_idx)
+{
+    const int hd = c->head_dim, rd = c->qk_rope, H = c->n_heads;
+
+    /* q: learned norm on the latent, then the per-head unweighted norm. */
+    dsv4_mmq(s->qr, x, &w->attn.wq_a);
+    dsv4_rmsnorm(s->qr, s->qr, w->attn.q_norm, c->q_lora, c->rms_eps);
+    dsv4_mmq(s->q, s->qr, &w->attn.wq_b);
+    for (int h = 0; h < H; h++) {
+        float *qh = s->q + (size_t)h * hd;
+        double sq = 0.0;
+        for (int i = 0; i < hd; i++) sq += (double)qh[i] * qh[i];
+        const float inv = (float)(1.0 / sqrt(sq / (double)hd + (double)c->rms_eps));
+        for (int i = 0; i < hd; i++) qh[i] *= inv;
+        dsv4_rope_apply(qh, hd, rd, cs, sn, pos, rd / 2, 0);
+    }
+
+    /* kv: one head, written into the sliding ring. */
+    dsv4_mmq(s->kv, x, &w->attn.wkv);
+    dsv4_rmsnorm(s->kv, s->kv, w->attn.kv_norm, hd, c->rms_eps);
+    dsv4_rope_apply(s->kv, hd, rd, cs, sn, pos, rd / 2, 0);
+    memcpy(kv_cache + (size_t)(pos % c->sliding_window) * hd, s->kv,
+           (size_t)hd * sizeof(float));
+
+    dsv4_sparse_attn(s->o, s->q, kv_cache, w->attn.sink, s->idxs,
+                     H, hd, n_idx, 1.0f / sqrtf((float)hd), s->attn_scratch);
+
+    /* De-rotate, then the GROUPED low-rank output projection. */
+    for (int h = 0; h < H; h++)
+        dsv4_rope_apply(s->o + (size_t)h * hd, hd, rd, cs, sn, pos, rd / 2, 1);
+
+    const int gw = H * hd / c->o_groups;       /* channels per group  */
+    const int gr = c->o_lora;                  /* rank per group      */
+    for (int g = 0; g < c->o_groups; g++) {
+        DSV4QMat slice = w->attn.wo_a;
+        /* wo_a is [o_groups*o_lora][gw]; group g owns rows [g*gr, (g+1)*gr). */
+        slice.rows = gr;
+        slice.cols = gw;
+        slice.w = (const char *)w->attn.wo_a.w + (size_t)g * gr * gw;
+        dsv4_mmq(s->ogrp + (size_t)g * gr, s->o + (size_t)g * gw, &slice);
+    }
+    dsv4_mmq(out, s->ogrp, &w->attn.wo_b);
+}
+
+/* MoE for one token. `token_id` is only read on hash-routed layers. */
+static void moe(float *out, const float *x, const DSV4LayerW *w,
+                const DSV4Cfg *c, DSV4Scratch *s, const DSV4ExpertSrc *src,
+                int layer, int token_id)
+{
+    dsv4_mmq(s->gate_scores, x, &w->moe.gate);
+    dsv4_route(s->topk_idx, s->topk_w, s->gate_scores, s->gate_orig,
+               w->moe.bias, w->moe.tid2eid, token_id,
+               c->n_experts, c->topk, c->routed_scale);
+
+    for (int i = 0; i < c->hidden; i++) out[i] = 0.0f;
+
+    for (int k = 0; k < c->topk; k++) {
+        const DSV4ExpertW *e = src->get(src->ctx, layer, s->topk_idx[k]);
+        if (!e) continue;                    /* caller-reported; see header */
+        expert_forward(s->x1, x, e, s, c->hidden, c->moe_inter, c->swiglu_limit);
+        const float wk = s->topk_w[k];
+        for (int i = 0; i < c->hidden; i++) out[i] += wk * s->x1[i];
+    }
+
+    /* The shared expert is added UNWEIGHTED, after the routed sum. */
+    expert_forward(s->x1, x, &w->moe.shared, s, c->hidden,
+                   c->moe_inter * c->n_shared, c->swiglu_limit);
+    for (int i = 0; i < c->hidden; i++) out[i] += s->x1[i];
+}
+
+/* One decoder layer. `h` is [hc_mult][hidden] in and out. */
+void dsv4_layer_forward(float *h, const DSV4LayerW *w, const DSV4Cfg *c,
+                        DSV4Scratch *s, const DSV4ExpertSrc *src,
+                        float *kv_cache, const float *cs, const float *sn,
+                        int pos, int token_id)
+{
+    const int hc = c->hc_mult, d = c->hidden;
+    const size_t wide = (size_t)hc * d;
+
+    /* ---- attention half ---- */
+    memcpy(s->resid, h, wide * sizeof(float));
+    dsv4_hc_pre(s->x1, s->post, s->comb, s->mixes, h, &w->hc_attn,
+                hc, d, c->hc_sinkhorn_iters, c->rms_eps, c->hc_eps);
+    dsv4_rmsnorm(s->x1, s->x1, w->attn_norm, d, c->rms_eps);
+
+    const int n_idx = dsv4_window_idxs(s->idxs, pos, c->sliding_window);
+    attention(s->qr, s->x1, w, c, s, kv_cache, cs, sn, pos, n_idx);
+
+    dsv4_hc_post(h, s->qr, s->resid, s->post, s->comb, hc, d);
+
+    /* ---- FFN half. The residual is taken HERE, not at the top. ---- */
+    memcpy(s->resid, h, wide * sizeof(float));
+    dsv4_hc_pre(s->x1, s->post, s->comb, s->mixes, h, &w->hc_ffn,
+                hc, d, c->hc_sinkhorn_iters, c->rms_eps, c->hc_eps);
+    dsv4_rmsnorm(s->x1, s->x1, w->ffn_norm, d, c->rms_eps);
+
+    moe(s->qr, s->x1, w, c, s, src, w->layer, token_id);
+
+    dsv4_hc_post(h, s->qr, s->resid, s->post, s->comb, hc, d);
+}
