@@ -222,7 +222,7 @@ typedef struct {
     DSV4QMat     wq_a;      /* FP8 [q_lora, hidden]            = [1024, 4096] */
     DSV4QMat     wq_b;      /* FP8 [n_heads*head_dim, q_lora]  = [32768,1024] */
     DSV4QMat     wkv;       /* FP8 [head_dim, hidden]          = [512,  4096] */
-    DSV4QMat     wo_a;      /* FP8 [o_lora*o_groups, hidden]   = [8192, 4096] */
+    DSV4QMat     wo_a;      /* FP8 [o_lora*o_groups, n_heads*head_dim/o_groups] = [8192,4096] */
     DSV4QMat     wo_b;      /* FP8 [hidden, o_lora*o_groups]   = [4096, 8192] */
     DSV4CompressorW comp;   /* valid when has_comp                            */
     DSV4IndexerW    idx;    /* valid when has_idx                             */

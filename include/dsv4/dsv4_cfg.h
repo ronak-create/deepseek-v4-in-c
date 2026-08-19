@@ -301,10 +301,25 @@ static inline int dsv4_cfg_load(DSV4Cfg *c, int *cr, int cr_max,
                 c->n_layers + c->num_nextn_predict);
         return 0;
     }
+    /* WHAT THE RATIO ACTUALLY SELECTS. This once rejected anything but 0, 4 and
+     * 128, on the reasoning that those are the only values the two released
+     * checkpoints use. That conflated "values I have seen" with "values that
+     * have a kernel" -- the one thing this validator exists not to do. Grepping
+     * for the constant found 128 in the error message and nowhere else:
+     * dsv4_compress.c pools over `ratio` tokens for any ratio, and dsv4_bind.c
+     * sizes the ape as ratio*coff*head_dim. Only three cases are structurally
+     * distinct, and two of them are exact values:
+     *
+     *     0        no Compressor at all             (model.py:466)
+     *     4        Compressor + Indexer, overlapped (model.py:290)
+     *     other    Compressor alone, non-overlapped
+     *
+     * A negative ratio stays an error: dsv4_compress_ratio() returns it verbatim
+     * and callers divide by it. */
     for (int i = 0; i < c->n_compress; i++) {
-        if (cr[i] != 0 && cr[i] != 4 && cr[i] != 128) {
-            fprintf(stderr, "dsv4_cfg: %s compress_ratios[%d] = %d; this engine "
-                            "implements 0 (dense), 4 (indexed) and 128\n",
+        if (cr[i] < 0) {
+            fprintf(stderr, "dsv4_cfg: %s compress_ratios[%d] = %d; a ratio is a"
+                            " token count and cannot be negative\n",
                     whence, i, cr[i]);
             return 0;
         }
@@ -366,20 +381,20 @@ static inline int dsv4_cfg_load(DSV4Cfg *c, int *cr, int cr_max,
         return 0;
     }
 
-    int n_dense = 0, n_idx = 0, n_128 = 0;
+    int n_dense = 0, n_idx = 0, n_cmp = 0, cmp_ratio = 0;
     for (int i = 0; i < c->n_compress; i++) {
         if      (cr[i] == 0) n_dense++;
         else if (cr[i] == 4) n_idx++;
-        else                 n_128++;
+        else               { n_cmp++; cmp_ratio = cr[i]; }
     }
 
     printf("config: %s | hidden=%d layers=%d vocab=%d | heads=%d kv=%d dim=%d\n"
-           "        attention: %d dense + %d indexed(top%d) + %d compressed-128\n"
+           "        attention: %d dense + %d indexed(top%d) + %d compressed(1:%d)\n"
            "        routing  : %d hash (tid2eid) + %d scored (gate.bias)\n"
            "        experts %d top%d shared%d inter=%d | mHC x%d (%d sinkhorn iters)\n",
            whence, c->hidden, c->n_layers, c->vocab,
            c->n_heads, c->n_kv_heads, c->head_dim,
-           n_dense, n_idx, c->index_topk, n_128,
+           n_dense, n_idx, c->index_topk, n_cmp, cmp_ratio,
            c->num_hash_layers, c->n_layers - c->num_hash_layers,
            c->n_experts, c->topk, c->n_shared, c->moe_inter,
            c->hc_mult, c->hc_sinkhorn_iters);

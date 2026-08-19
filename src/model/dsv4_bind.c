@@ -177,8 +177,17 @@ static void plan_layer(Plan *p, const DSV4Cfg *c, int L, DSV4LayerW *w)
          "layers.%d.attn.wq_b", L);
     reqq(p, &a->wkv,  DSV4_WFP8, c->head_dim, c->hidden, "layers.%d.attn.wkv", L);
     /* The output projection is low-rank AND grouped: o_lora_rank per group,
-     * o_groups groups. Flash: 1024 x 8 = 8192, matching wo_a [8192, 4096]. */
-    reqq(p, &a->wo_a, DSV4_WFP8, (int64_t)c->o_lora * c->o_groups, c->hidden,
+     * o_groups groups. The attention output (n_heads*head_dim) is cut into
+     * o_groups slices of gw = n_heads*head_dim/o_groups, and each slice meets
+     * its own [o_lora, gw] block of wo_a.
+     *
+     * THE COLUMN COUNT IS gw, NOT hidden. Flash makes those the same number --
+     * 64*512/8 = 4096 = hidden -- so writing c->hidden here validated Flash and
+     * Pro perfectly while encoding a coincidence as a rule. The tiny oracle,
+     * whose 4*8/2 = 16 is nothing like its hidden of 32, rejected the real
+     * checkpoint layout on the first bind. */
+    const int64_t gw = (int64_t)c->n_heads * c->head_dim / c->o_groups;
+    reqq(p, &a->wo_a, DSV4_WFP8, (int64_t)c->o_lora * c->o_groups, gw,
          "layers.%d.attn.wo_a", L);
     reqq(p, &a->wo_b, DSV4_WFP8, c->hidden, (int64_t)c->o_lora * c->o_groups,
          "layers.%d.attn.wo_b", L);
