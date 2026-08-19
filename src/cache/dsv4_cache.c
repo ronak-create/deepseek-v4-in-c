@@ -119,8 +119,8 @@ int dsv4_cache_init(DSV4Cache *c, const DSV4St *st, const DSV4Cfg *cfg,
                 "working set of\n"
                 "  %lld experts (%.2f GB). LRU cannot hit at this size -- every "
                 "entry is evicted\n"
-                "  before its layer comes round again. Raise --budget to at "
-                "least %.1f GB.\n",
+                "  before its layer comes round again. --budget must cover "
+                "the trunk AND this,\n  so raise it by at least %.1f GB.\n",
                 c->nslot, (double)budget_bytes / 1073741824.0,
                 (long long)ws, (double)(ws * c->expert_bytes) / 1073741824.0,
                 (double)(ws * c->expert_bytes) / 1073741824.0);
