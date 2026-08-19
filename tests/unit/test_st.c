@@ -64,7 +64,18 @@ int main(void)
         return 1;
     }
     printf("  ok    %d shard(s), %d tensors\n", s.nshard, s.nt);
-    CHECK(s.nt == 52, "indexed %d tensors, expected 52", s.nt);
+    /* The expected count comes from the generator, not from a literal here: a
+     * literal goes stale whenever a tensor is added and trains the reader to
+     * edit the number rather than ask why it moved. */
+    {
+        int expect = -1;
+        FILE *f = fopen("tests/fixtures/st/COUNT", "r");
+        if (f) { if (fscanf(f, "%d", &expect) != 1) expect = -1; fclose(f); }
+        CHECK(expect > 0, "tests/fixtures/st/COUNT unreadable; run 'make st-fixtures'");
+        if (expect > 0)
+            CHECK(s.nt == expect, "indexed %d tensors, generator wrote %d",
+                  s.nt, expect);
+    }
 
     printf("\n-- GATE 2  the three storage formats --\n");
     /* BF16, no scale partner. */

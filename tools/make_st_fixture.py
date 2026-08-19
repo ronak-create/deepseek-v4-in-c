@@ -169,6 +169,11 @@ def main():
     n = write_shard(out / "model-00001-of-00001.safetensors", TENSORS)
     print(f"  {out}/model-00001-of-00001.safetensors  {n:,} bytes, {len(TENSORS)} tensors")
 
+    # The gate reads this rather than hard-coding a count. A literal in the test
+    # goes stale every time a tensor is added, which trains the reader to edit
+    # the number instead of asking why it changed.
+    (out / "COUNT").write_text(f"{len(TENSORS)}\n")
+
     dts = sorted({t[1] for t in TENSORS})
     print(f"  dtypes covered: {' '.join(dts)}")
 
