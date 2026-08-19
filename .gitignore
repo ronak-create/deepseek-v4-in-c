@@ -4,3 +4,4 @@ build/
 __pycache__/
 tests/fixtures/st/
 tests/fixtures/st_bad/
+tests/fixtures/ref/
