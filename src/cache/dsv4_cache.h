@@ -65,10 +65,13 @@ typedef struct {
      * copied across. One 12 MB memcpy at ~10 GB/s costs ~1 ms against the ~10 ms
      * the unbuffered read saves.
      *
-     * NOT thread-safe: one buffer per cache. If expert loads are ever issued
-     * concurrently this must become per-thread. */
-    unsigned char *bounce;
-    int64_t        bounce_cap;
+     * ONE PER THREAD. Expert loads within a layer ARE issued concurrently --
+     * see dsv4_cache_get_many -- so a single shared staging buffer would have
+     * every reader scribbling over the others. nbounce is fixed at cache
+     * construction from the OpenMP thread count. */
+    unsigned char **bounce;
+    int             nbounce;
+    int64_t         bounce_cap;
     int            direct;      /* 1 when the shards opened O_DIRECT */
 
     /* Optional routing log: every (layer, expert) request in issue order, one
@@ -93,6 +96,33 @@ void dsv4_cache_free(DSV4Cache *c);
  * which callers must treat as fatal: routing a token through fewer experts than
  * the model specifies is a silently different model. */
 const DSV4ExpertW *dsv4_cache_get(DSV4Cache *c, int layer, int expert);
+
+/* Fetch n experts of one layer AT ONCE, reading the misses concurrently.
+ *
+ * WHY THIS EXISTS, AND WHY IT IS PER LAYER
+ *   Serialised one at a time, expert reads run at queue depth one: measured in
+ *   situ at 2.0 GB/s against 4.4 GB/s for the same drive under a benchmark, and
+ *   6.2 ms per 12.75 MB miss where an isolated read takes 2.8 ms. The fix is
+ *   more requests in flight, and the only place to find them is within a layer.
+ *
+ *   Cross-LAYER prefetch is not merely unimplemented, it is impossible: layer
+ *   L+1's router consumes layer L's output, so L+1's expert ids do not exist
+ *   until L has finished. (Layers below num_hash_layers are the exception --
+ *   tid2eid makes their experts a pure function of the token id.) Within one
+ *   layer, though, the top-k experts are chosen together and are mutually
+ *   independent, which is exactly the parallelism this takes.
+ *
+ * DETERMINISM. Slot selection, LRU stamps and eviction all happen in a serial
+ * pass in request order, before any I/O starts; only the reads themselves run
+ * in parallel. So the cache's state after a call does not depend on which read
+ * finished first, and the caller still accumulates in k order. Output stays
+ * bit-identical.
+ *
+ * out[k] is NULL for any expert that failed to load; callers must treat that as
+ * fatal for the same reason dsv4_cache_get's NULL is. Returns 0 if every
+ * expert loaded. */
+int dsv4_cache_get_many(DSV4Cache *c, int layer, const int *experts, int n,
+                        const DSV4ExpertW **out);
 
 void dsv4_cache_reset_stats(DSV4Cache *c);
 void dsv4_cache_report(const DSV4Cache *c, const char *label);

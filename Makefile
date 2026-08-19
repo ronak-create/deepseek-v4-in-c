@@ -17,7 +17,25 @@ BIN   := bin
 
 .PHONY: all test cfg-fixtures st-fixtures ref-fixtures tok-fixtures fixtures clean help
 
-all: $(BIN)/dsv4 $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress $(BIN)/test_indexer $(BIN)/test_layer $(BIN)/test_cache $(BIN)/test_bindmem $(BIN)/test_oracle $(BIN)/test_layer_oracle $(BIN)/test_trunk $(BIN)/test_tok $(BIN)/test_model_oracle
+# EVERY binary depends on EVERY engine source and header.
+#
+# The per-target rules below list only the sources each one compiles, which is
+# accurate but not sufficient: editing src/cache/dsv4_cache.c did NOT rebuild
+# bin/test_cache, so a gate silently kept testing the previous build and
+# reported a failure that had already been instrumented away. Twice.
+#
+# Rebuilding twenty small binaries on any header change costs a few seconds and
+# removes a whole class of phantom results, so it is not a trade worth tuning.
+ENGINE := $(wildcard src/core/*.c src/core/*.h src/io/*.c src/io/*.h \
+                     src/cache/*.c src/cache/*.h src/model/*.c src/model/*.h \
+                     src/tokenizer/*.c src/tokenizer/*.h \
+                     include/dsv4/*.h third_party/*.h)
+ALLBIN := $(BIN)/dsv4 $(BIN)/test_cfg $(BIN)/test_st $(BIN)/test_bind $(BIN)/test_quant $(BIN)/test_matmul $(BIN)/test_ops $(BIN)/test_hc $(BIN)/test_rope $(BIN)/test_attn $(BIN)/test_compress $(BIN)/test_indexer $(BIN)/test_layer $(BIN)/test_cache $(BIN)/test_bindmem $(BIN)/test_oracle $(BIN)/test_layer_oracle $(BIN)/test_trunk $(BIN)/test_tok $(BIN)/test_model_oracle
+
+all: $(ALLBIN)
+
+$(ALLBIN): $(ENGINE)
+
 
 $(BIN)/test_cfg: tests/unit/test_cfg.c include/dsv4/dsv4.h include/dsv4/dsv4_cfg.h
 	@mkdir -p $(BIN)

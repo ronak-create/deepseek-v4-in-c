@@ -115,7 +115,7 @@ void dsv4_state_free(DSV4LayerState *st)
 
 /* ---------------------------------------------------------------- scratch --- */
 
-int dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c)
+int dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c, int max_pos)
 {
     memset(s, 0, sizeof *s);
     const size_t hc    = (size_t)c->hc_mult;
@@ -144,7 +144,7 @@ int dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c)
         + 4u * (size_t)c->head_dim                  /* comp kv/score in    */
         + (size_t)c->index_n_heads * (size_t)c->index_head_dim  /* idx q  */
         + (size_t)c->index_n_heads                  /* idx head weights    */
-        + (size_t)(c->max_pos ? 4096 : 4096);       /* idx scores          */
+        + (size_t)max_pos + 1;                      /* idx scores          */
 
     /* qr must hold max(q_lora, hidden): it carries the q latent and is reused
      * for the block's hidden-width output. Sizing it to q_lora alone overflows
@@ -177,7 +177,8 @@ int dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c)
     s->comp_sc_in = p;   p += 2u * (size_t)c->head_dim;
     s->idx_q = p;        p += (size_t)c->index_n_heads * (size_t)c->index_head_dim;
     s->idx_w = p;        p += (size_t)c->index_n_heads;
-    s->idx_scores = p;   p += 4096;
+    s->idx_scores = p;   p += (size_t)max_pos + 1;
+    s->idx_cap = max_pos + 1;
 
     s->idxs = (int *)calloc(nidx, sizeof(int));
     if (!s->idxs) { free(a); s->arena = NULL; return -1; }
@@ -262,6 +263,16 @@ static void attention(float *out, const float *x, const DSV4LayerW *w,
          * ratio takes them all, in order. Both then offset into the cache by
          * sliding_window, because the window occupies the front. */
         const int avail = st->n_compressed;
+        if (avail > s->idx_cap) {
+            /* Impossible once the scratch is sized from the same max_pos as the
+             * state: n_compressed is max_pos/ratio + 1 and ratio >= 1. Checked
+             * anyway, because the alternative to stopping here is scribbling
+             * past the arena and producing plausible numbers. */
+            fprintf(stderr, "dsv4_layer: %d compressed rows but idx_scores "
+                            "holds %d; scratch and state disagree on max_pos\n",
+                    avail, s->idx_cap);
+            abort();
+        }
         int take = avail;
         if (avail > 0) {
             if (w->has_idx) {
@@ -373,18 +384,28 @@ static void moe(float *out, const float *x, const DSV4LayerW *w,
      * That was a live bug. Per-kernel gates could not see it: every matmul and
      * every activation was correct, and the caller handed one of them a buffer
      * that aliased its own input. The whole-block oracle caught it. */
+    /* Fetch the whole top-k first, so the misses can be read concurrently.
+     * The accumulation below still runs in k order, so the sum is unchanged to
+     * the bit whichever read finishes first. */
+    const DSV4ExpertW *ex[DSV4_MAX_TOPK];
+    t0 = pnow();
+    if (src->get_many) {
+        src->get_many(src->ctx, layer, s->topk_idx, c->topk, ex);
+    } else {
+        for (int k = 0; k < c->topk; k++)
+            ex[k] = src->get(src->ctx, layer, s->topk_idx[k]);
+    }
+    dsv4_prof.expert_io += pnow() - t0;
+
+    t0 = pnow();
     for (int k = 0; k < c->topk; k++) {
-        t0 = pnow();
-        const DSV4ExpertW *e = src->get(src->ctx, layer, s->topk_idx[k]);
-        const double t1 = pnow();
-        dsv4_prof.expert_io += t1 - t0;
-        if (!e) continue;                    /* caller-reported; see header */
-        expert_forward(s->expert_acc, x, e, s, c->hidden, c->moe_inter,
+        if (!ex[k]) continue;                /* caller-reported; see header */
+        expert_forward(s->expert_acc, x, ex[k], s, c->hidden, c->moe_inter,
                        c->swiglu_limit);
         const float wk = s->topk_w[k];
         for (int i = 0; i < c->hidden; i++) out[i] += wk * s->expert_acc[i];
-        dsv4_prof.expert_mm += pnow() - t1;
     }
+    dsv4_prof.expert_mm += pnow() - t0;
 
     /* The shared expert is added UNWEIGHTED, after the routed sum. */
     t0 = pnow();

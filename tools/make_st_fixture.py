@@ -82,6 +82,7 @@ TENSORS = [
     ("layers.2.ffn.experts.0.w3.weight",            "I8",      [2048, 2048]),
     ("layers.2.ffn.experts.0.w3.scale",             "F8_E8M0", [2048, 128]),
 
+
     # --- layer 3: ratio 128, NO indexer, scored routing ------------------------
     # Deliberately complete, and deliberately WITHOUT any indexer.* tensor: the
     # binder must not request one here, and the gate checks that it does not.
@@ -129,6 +130,27 @@ TENSORS = [
     ("layers.3.ffn.experts.0.w3.weight",            "I8",      [2048, 2048]),
     ("layers.3.ffn.experts.0.w3.scale",             "F8_E8M0", [2048, 128]),
 ]
+
+# Routed experts 1..5 on layer 2, so the CONCURRENT fetch has something to be
+# concurrent about. With only expert 0 the comparison against the serial path is
+# vacuous: dsv4_cache_get_many's parallel branch is guarded by `ntodo > 1` and
+# would never be entered, and a gate that cannot fail is not a gate.
+#
+# Shapes are copied from expert 0 rather than derived, because the FP4 scale
+# grid is 1x32 over the UNPACKED columns while the weight is packed 2 per byte:
+# w1 [2048, 2048] bytes carries 4096 columns and so scales [2048, 128], and w2
+# [4096, 1024] bytes carries 2048 columns and so scales [4096, 64]. Deriving
+# that in one expression is exactly how the two grids get confused.
+for _e in range(1, 6):
+    TENSORS += [
+        ("layers.2.ffn.experts.%d.w1.weight" % _e, "I8",      [2048, 2048]),
+        ("layers.2.ffn.experts.%d.w1.scale"  % _e, "F8_E8M0", [2048, 128]),
+        ("layers.2.ffn.experts.%d.w2.weight" % _e, "I8",      [4096, 1024]),
+        ("layers.2.ffn.experts.%d.w2.scale"  % _e, "F8_E8M0", [4096, 64]),
+        ("layers.2.ffn.experts.%d.w3.weight" % _e, "I8",      [2048, 2048]),
+        ("layers.2.ffn.experts.%d.w3.scale"  % _e, "F8_E8M0", [2048, 128]),
+    ]
+
 
 ELEMSIZE = {
     "F32": 4, "BF16": 2, "F16": 2, "U8": 1,

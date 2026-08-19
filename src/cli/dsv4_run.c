@@ -45,6 +45,12 @@ static const DSV4ExpertW *dsv4_run_get_expert(void *ctx, int layer, int e)
     return dsv4_cache_get((DSV4Cache *)ctx, layer, e);
 }
 
+static int dsv4_run_get_experts(void *ctx, int layer, const int *e, int n,
+                                const DSV4ExpertW **out)
+{
+    return dsv4_cache_get_many((DSV4Cache *)ctx, layer, e, n, out);
+}
+
 static double now_s(void)
 {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -167,13 +173,13 @@ int main(int argc, char **argv)
                     c.yarn_beta_fast, c.yarn_beta_slow);
 
     DSV4Scratch scratch;
-    if (dsv4_scratch_init(&scratch, &c) != 0) return 1;
+    if (dsv4_scratch_init(&scratch, &c, maxpos) != 0) return 1;
 
     DSV4LayerState *lst = calloc((size_t)c.n_layers, sizeof(DSV4LayerState));
     for (int L = 0; L < c.n_layers; L++)
         if (dsv4_state_init(&lst[L], &c, L, maxpos) != 0) return 1;
 
-    DSV4ExpertSrc src = { dsv4_run_get_expert, &cache };
+    DSV4ExpertSrc src = { dsv4_run_get_expert, dsv4_run_get_experts, &cache };
 
     int32_t ids[8192];
     const int nprompt = dsv4_tok_encode(&tok, prompt, (int)strlen(prompt),

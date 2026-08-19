@@ -208,8 +208,8 @@ static int run_case(const char *file, const char *label)
     dsv4_rope_table(cs, sn, c.qk_rope, 128, 0, 10000.0, 16.0, 32.0, 1.0);
 
     DSV4Scratch s;
-    if (dsv4_scratch_init(&s, &c) != 0) { printf("  FAIL  scratch\n"); return 1; }
-    DSV4ExpertSrc src = { get_expert, NULL };
+    if (dsv4_scratch_init(&s, &c, 128) != 0) { printf("  FAIL  scratch\n"); return 1; }
+    DSV4ExpertSrc src = { get_expert, NULL, NULL };
 
     static float h[1024];
     DSV4LayerState lstate;

@@ -130,6 +130,53 @@ int main(void)
         dsv4_cache_free(&k);
     }
 
+    printf("\n-- GATE 6  the concurrent fetch equals the serial one, byte for byte --\n");
+    {
+        /* dsv4_cache_get_many reads its misses on several threads at once. The
+         * bytes it produces must be indistinguishable from six calls to
+         * dsv4_cache_get, or every token downstream is quietly different. Two
+         * caches, same requests, compared byte for byte -- not by pointer, and
+         * not by shape. */
+        /* Layer 2 experts 0..5 exist in the fixture; 2 appears twice on purpose. */
+        const int ids[6] = { 4, 2, 5, 0, 2, 3 };
+        DSV4Cache a, b;
+        dsv4_cache_init(&a, &st, &c, 1LL << 30);
+        dsv4_cache_init(&b, &st, &c, 1LL << 30);
+
+        const DSV4ExpertW *many[6];
+        const int rc = dsv4_cache_get_many(&b, 2, ids, 6, many);
+        CHECK(rc == 0, "get_many reported failure (%d)", rc);
+
+        int bad = 0;
+        for (int k = 0; k < 6; k++) {
+            const DSV4ExpertW *one = dsv4_cache_get(&a, 2, ids[k]);
+            if (!one || !many[k]) { CHECK(0, "expert %d missing", ids[k]); continue; }
+            const struct { const DSV4QMat *x, *y; const char *n; } m[3] = {
+                { &one->w1, &many[k]->w1, "w1" },
+                { &one->w2, &many[k]->w2, "w2" },
+                { &one->w3, &many[k]->w3, "w3" },
+            };
+            for (int q = 0; q < 3; q++) {
+                const int64_t nb = (int64_t)m[q].x->rows * m[q].x->cols / 2;
+                if (memcmp(m[q].x->w, m[q].y->w, (size_t)nb) != 0) {
+                    CHECK(0, "expert %d %s weights differ", ids[k], m[q].n); bad++;
+                }
+                const int64_t ns = (int64_t)m[q].x->rows
+                                 * ((m[q].x->cols + 31) / 32);
+                if (memcmp(m[q].x->s, m[q].y->s, (size_t)ns) != 0) {
+                    CHECK(0, "expert %d %s scales differ", ids[k], m[q].n); bad++;
+                }
+            }
+        }
+        /* The repeated id must be served from the same slot, not loaded twice. */
+        CHECK(many[1] == many[4], "the duplicate request took a second slot");
+        if (!bad && rc == 0) printf("  ok    6 experts (one repeated) identical to the "
+                         "serial path, %lld bytes each\n",
+                         (long long)b.expert_bytes);
+        dsv4_cache_free(&a);
+        dsv4_cache_free(&b);
+    }
+
     dsv4_st_close(&st);
     printf("\n");
     if (fails) { printf("CACHE GATE FAILED: %d check(s)\n", fails); return 1; }

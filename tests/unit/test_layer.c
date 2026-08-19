@@ -157,13 +157,13 @@ int main(void)
             sn[t * (RD / 2) + i] = sinf((float)t * 0.1f);
         }
 
-    DSV4ExpertSrc src = { get_expert, NULL };
+    DSV4ExpertSrc src = { get_expert, NULL, NULL };
 
     printf("\n-- GATE 1  a block runs and keeps the stream finite --\n");
     {
         build(0);
         DSV4Scratch s;
-        CHECK(dsv4_scratch_init(&s, &g_cfg) == 0, "scratch allocation failed");
+        CHECK(dsv4_scratch_init(&s, &g_cfg, 64) == 0, "scratch allocation failed");
         float *h = alloc_f(hcd);
         DSV4LayerState lstate;
         dsv4_state_init(&lstate, &g_cfg, 0, 64);
@@ -191,7 +191,7 @@ int main(void)
          * token_id were dropped somewhere between the block and the gate, this
          * is the only gate that would notice. */
         build(1);
-        DSV4Scratch s; dsv4_scratch_init(&s, &g_cfg);
+        DSV4Scratch s; dsv4_scratch_init(&s, &g_cfg, 64);
         float *h1 = alloc_f(hcd), *h2 = alloc_f(hcd);
         DSV4LayerState lstate;
         fill(h1, hcd, 88, 0.1f);
@@ -216,7 +216,7 @@ int main(void)
          * so passing a different token must change nothing. If it does, the
          * token has leaked into a path that should not see it. */
         build(0);
-        DSV4Scratch s; dsv4_scratch_init(&s, &g_cfg);
+        DSV4Scratch s; dsv4_scratch_init(&s, &g_cfg, 64);
         float *h1 = alloc_f(hcd), *h2 = alloc_f(hcd);
         DSV4LayerState lstate;
         fill(h1, hcd, 88, 0.1f);
@@ -237,7 +237,7 @@ int main(void)
     printf("\n-- GATE 4  position advances the KV ring and changes the output --\n");
     {
         build(0);
-        DSV4Scratch s; dsv4_scratch_init(&s, &g_cfg);
+        DSV4Scratch s; dsv4_scratch_init(&s, &g_cfg, 64);
         float *h = alloc_f(hcd);
         DSV4LayerState lstate;
         dsv4_state_init(&lstate, &g_cfg, 0, 64);
@@ -277,7 +277,7 @@ int main(void)
          * forced to zero, the result must STILL differ from the input, because
          * the residual carries it. */
         build(0);
-        DSV4Scratch s; dsv4_scratch_init(&s, &g_cfg);
+        DSV4Scratch s; dsv4_scratch_init(&s, &g_cfg, 64);
         float *h = alloc_f(hcd);
         DSV4LayerState lstate;
         dsv4_state_init(&lstate, &g_cfg, 0, 64);

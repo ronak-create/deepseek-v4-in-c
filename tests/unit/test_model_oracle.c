@@ -176,10 +176,10 @@ int main(int argc, char **argv)
                     c.yarn_beta_fast, c.yarn_beta_slow);
 
     DSV4Scratch s;
-    if (dsv4_scratch_init(&s, &c) != 0) { printf("  FAIL  scratch\n"); return 1; }
+    if (dsv4_scratch_init(&s, &c, maxpos) != 0) { printf("  FAIL  scratch\n"); return 1; }
     DSV4LayerState *ls = calloc((size_t)c.n_layers, sizeof(DSV4LayerState));
     for (int L = 0; L < c.n_layers; L++) dsv4_state_init(&ls[L], &c, L, maxpos);
-    DSV4ExpertSrc src = { ge, NULL };
+    DSV4ExpertSrc src = { ge, NULL, NULL };
 
     const int hc = c.hc_mult, d = c.hidden;
     float *h = calloc((size_t)hc * d, sizeof(float));

@@ -16,6 +16,7 @@ typedef struct {
                           * alias the MoE input -- see dsv4_layer.c */
     float *comp_kv_in, *comp_sc_in;   /* compressor projections, one token */
     float *idx_q, *idx_w, *idx_scores; /* CSA indexer working set          */
+    int    idx_cap;                    /* how many scores idx_scores holds  */
     float *attn_scratch;
     int   *idxs;
     int    topk_idx[DSV4_MAX_TOPK];
@@ -32,10 +33,24 @@ typedef struct {
  * leaves a token routed through fewer experts than the model specifies. */
 typedef struct {
     const DSV4ExpertW *(*get)(void *ctx, int layer, int expert);
+    /* Optional. Fetch a whole layer's top-k at once so the misses can be read
+     * concurrently -- serialised, they run at queue depth one and miss the
+     * drive's plateau by better than 2x. May be NULL, in which case the layer
+     * falls back to calling get() in a loop, which is correct and slower. The
+     * accumulation order does not change either way, so neither does the
+     * output. */
+    int (*get_many)(void *ctx, int layer, const int *experts, int n,
+                    const DSV4ExpertW **out);
     void *ctx;
 } DSV4ExpertSrc;
 
-int  dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c);
+/* max_pos must be the SAME bound passed to dsv4_state_init. The indexer scores
+ * one candidate per compressed row, and the compressed row count is a function
+ * of max_pos -- so a scratch sized without it is sized by guesswork. It was:
+ * idx_scores held a literal 4096 floats, which happened to suffice only because
+ * the CLI passes sliding_window + 4096 and the smallest indexed ratio is 4.
+ * Raise the context and that becomes a heap overflow with no warning. */
+int  dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c, int max_pos);
 void dsv4_scratch_free(DSV4Scratch *s);
 
 /* PER-LAYER state that persists across tokens.
