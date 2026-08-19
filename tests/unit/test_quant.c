@@ -6,11 +6,11 @@
  * states a number, from kernel.py). Deriving them by running the code under test
  * would prove only that it is self-consistent.
  *
- * NOT COVERED: the FP4 nibble ORDER. kernel.py delegates packing to the
- * float4_e2m1fn_x2 dtype, so it cannot be established from anything on disk.
- * GATE 5 pins the property that IS knowable -- that the two nibbles decode to
- * the two distinct values and that the mapping is a bijection -- and states
- * plainly what remains unverified.
+ * THE FP4 NIBBLE ORDER IS SETTLED, and GATE 5 pins it. kernel.py delegates
+ * packing to the float4_e2m1fn_x2 dtype, so it cannot be read off anything in
+ * the checkpoint -- but the checkpoint was WRITTEN by PyTorch into that dtype,
+ * so PyTorch's own header is the specification. See dsv4_quant.h for the
+ * citation and for the two measurement routes that dead-ended first.
  */
 #include <stdio.h>
 #include <math.h>
