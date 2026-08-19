@@ -76,4 +76,37 @@ int  dsv4_bind_model(const DSV4St *s, const DSV4Cfg *c, int want_head,
                      DSV4ModelBind *m);
 void dsv4_bind_model_free(DSV4ModelBind *m);
 
+/* ---- binding from a memory buffer, for the streaming trunk ----------------
+ *
+ * The trunk holds a layer's tensors as a verbatim copy of their bytes in
+ * trunk.bin. Binding from that buffer MUST use exactly the same tensor names,
+ * shapes and narrow/wide decisions as binding from the shards, or the two paths
+ * silently diverge and only one of them is the model. So it walks the SAME
+ * plan_layer(); only the source of the bytes differs.
+ *
+ * find() reports where a tensor sits inside the run. Most tensors then need no
+ * copy at all: a narrow matrix is pointed at directly, in place. Only the small
+ * vectors that kernels read elementwise are widened into `widen`.
+ *
+ * EVERY WIDENED TENSOR IS BF16 OR F32 -- verified against plan_layer: the FP8
+ * and packed-FP4 matrices all go through reqq(), which requests them narrow,
+ * because they cannot be widened without their scale partner anyway. So the
+ * widen area only ever needs 4 bytes per element, never more.
+ */
+typedef struct {
+    int (*find)(void *ctx, const char *name,
+                int64_t *off, int64_t *nbytes, int *dtype);
+    void *ctx;
+} DSV4MemSrc;
+
+int dsv4_bind_layer_mem(const DSV4Cfg *c, int layer, DSV4LayerBind *b,
+                        const unsigned char *run, const DSV4MemSrc *src,
+                        unsigned char *widen, size_t widen_cap,
+                        size_t *widen_used);
+
+/* Upper bound on the widen area one layer needs, so a trunk slot can be sized
+ * once for every layer kind. Uses the WIDEST layer (ratio 4, which carries both
+ * a compressor and an indexer), because slots are uniform. */
+size_t dsv4_bind_widen_bytes(const DSV4Cfg *c);
+
 #endif /* DSV4_BIND_H */

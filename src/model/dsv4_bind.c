@@ -384,3 +384,117 @@ void dsv4_bind_model_free(DSV4ModelBind *m)
     free(m->blob);
     memset(m, 0, sizeof *m);
 }
+
+/* ------------------------------------------------- binding from memory ----- */
+
+/* Widen `n` elements of `dtype` from `src` into `dst` as f32.
+ * Only BF16 and F32 ever reach here -- see the note in dsv4_bind.h. */
+static int widen_into(float *dst, const unsigned char *src, int64_t n, int dtype)
+{
+    if (dtype == DSV4_DT_F32) {
+        memcpy(dst, src, (size_t)n * sizeof(float));
+        return 0;
+    }
+    if (dtype == DSV4_DT_BF16) {
+        const uint16_t *p = (const uint16_t *)src;
+        for (int64_t i = 0; i < n; i++) {
+            union { uint32_t u; float f; } v;
+            v.u = (uint32_t)p[i] << 16;
+            dst[i] = v.f;
+        }
+        return 0;
+    }
+    /* Anything else is a planning bug, not a data problem: plan_layer only ever
+     * marks BF16/F32 vectors wide. Refusing loudly beats widening garbage. */
+    fprintf(stderr, "dsv4_bind: cannot widen dtype %d from a trunk run\n", dtype);
+    return -1;
+}
+
+size_t dsv4_bind_widen_bytes(const DSV4Cfg *c)
+{
+    /* Trunk slots are uniform, so this must be the MAXIMUM over every layer.
+     *
+     * It is computed by planning all of them rather than by picking the layer
+     * kind that "obviously" needs most. The obvious pick is wrong: an earlier
+     * version chose the ratio-4 indexed layer, on the reasoning that it alone
+     * carries both a compressor and an indexer. But the compressor's `ape` is
+     * ratio * coff * head_dim, so a ratio-128 layer needs 128*1*512 = 65,536
+     * floats against a ratio-4 layer's 4*2*512 = 4,096 -- sixteen times more,
+     * and enough to under-size every slot. The gate caught it.
+     *
+     * n_layers is at most 61, and planning is pure name formatting, so the
+     * exhaustive answer costs nothing and cannot be wrong. */
+    size_t worst = 0;
+    for (int L = 0; L < c->n_layers; L++) {
+        Plan p; memset(&p, 0, sizeof p);
+        DSV4LayerW tmp;
+        plan_layer(&p, c, L, &tmp);
+
+        size_t total = 0;
+        for (int i = 0; i < p.n; i++)
+            if (!p.r[i].narrow)
+                total = align8(total + (size_t)p.r[i].want * sizeof(float));
+        if (total > worst) worst = total;
+    }
+    return worst;
+}
+
+int dsv4_bind_layer_mem(const DSV4Cfg *c, int layer, DSV4LayerBind *b,
+                        const unsigned char *run, const DSV4MemSrc *src,
+                        unsigned char *widen, size_t widen_cap,
+                        size_t *widen_used)
+{
+    memset(b, 0, sizeof *b);
+    b->layer = layer;
+    b->blob = NULL;                 /* the run is borrowed, not owned */
+
+    Plan p; memset(&p, 0, sizeof p);
+    plan_layer(&p, c, layer, &b->w);
+
+    size_t woff = 0;
+    for (int i = 0; i < p.n; i++) {
+        Req *q = &p.r[i];
+        int64_t off = 0, nbytes = 0;
+        int dtype = 0;
+        if (src->find(src->ctx, q->name, &off, &nbytes, &dtype) != 0) {
+            fprintf(stderr, "dsv4_bind: %s is not in the trunk run for layer %d\n",
+                    q->name, layer);
+            return -1;
+        }
+
+        const int esz = dsv4_st_elemsize((DSV4Dtype)dtype);
+        if (esz <= 0) {
+            fprintf(stderr, "dsv4_bind: %s has unusable dtype %d\n", q->name, dtype);
+            return -1;
+        }
+        const int64_t have = nbytes / esz;
+        /* The same element-count check the shard path makes. A trunk packed
+         * from a different checkpoint would otherwise bind silently. */
+        if (q->want >= 0 && have != q->want) {
+            fprintf(stderr, "dsv4_bind: %s holds %lld elements in the trunk, "
+                            "config implies %lld\n", q->name,
+                    (long long)have, (long long)q->want);
+            return -1;
+        }
+
+        if (q->narrow) {
+            /* No copy: point straight into the run. This is why streaming a
+             * layer costs one read and no unpacking. */
+            *q->dest = run + off;
+        } else {
+            const size_t need = (size_t)have * sizeof(float);
+            if (woff + need > widen_cap) {
+                fprintf(stderr, "dsv4_bind: widen area too small for layer %d "
+                                "(need %zu, have %zu)\n", layer, woff + need, widen_cap);
+                return -1;
+            }
+            if (widen_into((float *)(widen + woff), run + off, have, dtype) != 0)
+                return -1;
+            *q->dest = widen + woff;
+            woff = align8(woff + need);
+        }
+    }
+
+    if (widen_used) *widen_used = woff;
+    return 0;
+}
