@@ -2,7 +2,7 @@
 
 DeepSeek-V4 in C99, running a checkpoint far larger than RAM by streaming it off
 NVMe. Flash (284B parameters, ~160 GB on disk) runs on a laptop from **3.2 GB of
-RAM**, and at **1.81 s/token** when given 18 GB and the GPU.
+RAM**, and at **1.6 – 1.7 s/token** when given 18 GB and the GPU.
 
 It is the instruct model, so it holds a conversation and writes code — see
 [Chat and code](#chat-and-code).
@@ -18,8 +18,8 @@ written from DeepSeek's own reference implementation.
 
 | | |
 |---|---|
-| DeepSeek-V4-Flash, CPU | ✅ 2.65 s/token |
-| DeepSeek-V4-Flash, `--gpu` | ✅ 1.81 s/token |
+| DeepSeek-V4-Flash, CPU | ✅ 2.14 – 2.21 s/token |
+| DeepSeek-V4-Flash, `--gpu` | ✅ 1.62 – 1.74 s/token |
 | Smallest machine it runs on | ✅ **3.23 GB peak RSS** |
 | Chat + tool-call encoding | ✅ `--chat`, stops at end-of-turn |
 | DeepSeek-V4-Pro | ⚠️ planned and gated, never run — needs ~865 GB of disk |
@@ -55,7 +55,15 @@ stays the reference.
 
 ```sh
 make            # CPU only
-make test       # the full gate ladder
+make test       # the gate ladder
+make bench      # matmul_bw, gpu_contention, cache_bw
+```
+
+`make test` runs 20 gates. The 21st, the trunk gate, needs a real checkpoint and
+a packed trunk and skips without them:
+
+```sh
+DSV4_MODEL=~/models/dsv4-flash DSV4_TRUNK=~/dsv4-trunk make test
 ```
 
 CUDA is auto-detected. With `nvcc` present it compiles the GPU path and links
@@ -105,14 +113,21 @@ correctness. Measured on Flash, same prompt:
 
 | `--budget` | peak RAM | s/token | layers pinned |
 |---|---|---|---|
-| 1 GB | **3.23 GB** | 13.7 | 5 / 43 |
-| 2 GB | 4.23 GB | 12.6 | 12 / 43 |
-| 4 GB | 6.23 GB | 11.6 | 25 / 43 |
-| 8 GB | 10.08 GB | 9.3 | 43 / 43 |
-| 16 GB + `--gpu` | 18.2 GB | **1.81** | 43 / 43 |
+| 1 GB | **3.23 GB** | 4.64 | 5 / 43 |
+| 2 GB | 4.23 GB | 3.95 | 12 / 43 |
+| 3 GB | 5.23 GB | 3.42 | 18 / 43 |
+| 4 GB | 6.23 GB | 3.12 | 25 / 43 |
+| 8 GB | 10.08 GB | 2.37 | 43 / 43 |
+| 16 GB | 18.08 GB | 2.14 – 2.21 | 43 / 43 |
+| 16 GB + `--gpu` | 18.19 GB | **1.62 – 1.74** | 43 / 43 |
 
-(The slower rows are short runs, so cold-cache cost is spread over fewer
-tokens; treat them as an upper bound on what a small machine pays.)
+Ranges are two runs of the same command; single figures are one run. These are
+short runs, so the fixed cost of filling a cold cache is spread over 26 tokens
+— treat the small-budget rows as an upper bound on what a small machine pays.
+
+Below 8 GB the trunk no longer pins and streams through ring slots instead; the
+3 GB row exists to exercise that path, and it produces the same tokens as the
+rows that pin all 43 layers.
 
 ### Choose `--budget` deliberately
 
@@ -177,24 +192,98 @@ this CLI.
 
 ## Where the time goes
 
-`--budget 16 --gpu`, 40 forward passes on Flash:
+`--budget 16 --gpu`, 40 forward passes on Flash (15 prompt + 25 generated),
+98% of wall clock accounted for:
 
 ```
-routed experts (disk)   27%   NVMe — cannot be moved anywhere
-attention               33%   FP8, on the GPU when --gpu
-routed experts (matmul) 25%   FP4, CPU — streamed, so it stays here
-shared expert            7%
-mHC + norms              2%
+routed experts (disk)   38.0%   17.2 s   NVMe — cannot be moved anywhere
+attention               32.2%   14.6 s   FP8, on the GPU when --gpu
+routed experts (matmul) 16.5%    7.5 s   FP4, CPU — streamed, so it stays here
+shared expert            7.6%    3.4 s
+mHC + norms              3.0%    1.4 s
+router                   0.5%    0.2 s
 ```
+
+Disk is the largest single line. Note that 15 of these 40 passes are prompt
+tokens — see [Prefill is the expensive half](#prefill-is-the-expensive-half-and-it-is-not-batched).
 
 The routed experts stay on the CPU on purpose: 137 GB, none of it resident,
 streamed per token. Sending them across PCIe would add a hop to a disk read.
 
-**If you use `--gpu`, one CPU core is reserved automatically.** CUDA's default
-sync spins, and a spinning thread on a pool with one OpenMP worker per core
-competes with the threads it is waiting behind. Measured: CPU-side matmul
-collapses from 114 GF/s to 5.0 GF/s (21.7×) — and returns to 0.99× the moment a
-core is held back. On the real model that was 142 s versus 47 s.
+**If you use `--gpu`, one CPU core is reserved automatically**, and an explicit
+`OMP_NUM_THREADS` overrides that. In a microbenchmark the effect is enormous —
+a CPU-only FP4 matmul collapses 30x while the device is kept busy, and recovers
+completely when a core is held back (see [The GPU needs a spare
+core](#the-gpu-needs-a-spare-core)).
+
+On the real model it is much smaller than that, and smaller than this README
+previously claimed. Measured cold, over two runs each:
+
+| `--budget 16 --gpu` | s/token |
+|---|---|
+| one core reserved (default) | **1.62 – 1.74** |
+| `OMP_NUM_THREADS=20`, no reservation | 1.88 – 1.91 |
+
+That is 10–15%, not the 142 s versus 47 s recorded in the heat-soaked session.
+The microbenchmark keeps the device saturated back to back; the model only
+touches it a few times per layer, so the pathology is real but rarely at full
+strength. The reservation is still the right default — it never loses — but it
+is a modest win, not a 3x one.
+
+## Prefill is the expensive half, and it is not batched
+
+Prompt tokens go through the engine **one at a time**, exactly like generated
+ones. That is a deliberate gap, and this is what it costs. Two runs of the same
+command differing only in prompt length, `--budget 16 --gpu`:
+
+| prompt | forward passes | wall | |
+|---|---|---|---|
+| 15 tokens | 40 | 42.1 s | |
+| 207 tokens | 232 | 234.8 s | |
+| **marginal** | **192** | **192.7 s** | **1.00 s per prompt token** |
+
+So a prompt token costs about 1.0 s against 1.62 s for a generated one. It is
+cheaper only because the attention context is shorter — the weight traffic is
+identical, because each token still does its own GEMV against every matrix.
+
+That sets time-to-first-token at roughly **a second per prompt token**: ~3.5
+minutes for a 207-token prompt, and over half an hour for a 2,000-token one.
+For anything with a long prompt — code completion, an agent loop, retrieval —
+this, not the generation rate, is the number that hurts.
+
+### What a batched GEMM would actually buy
+
+The fix is to run N prompt tokens through a layer together so each weight is
+read once and used N times, lifting arithmetic intensity from ~1 flop/byte
+toward N. How much reuse is really available is a property of the routing, so
+it can be measured rather than guessed — replaying a `--route-log` and counting
+requests against distinct experts per layer over the prefill window:
+
+| prefill length | tokens sharing one expert weight load |
+|---|---|
+| 15 | 2.26 |
+| 32 | 2.93 |
+| 64 | 3.94 |
+| 128 | 5.80 |
+| 207 | **7.99** |
+
+Routed experts are the awkward case: top-6 of 256 spreads tokens thin, so a
+15-token prompt gets almost nothing (2.26x) and the reuse only becomes real
+past ~100 tokens. The shared expert and the dense trunk matmuls have no such
+problem — every token passes through the same weights, so they batch N-wide
+whatever N is.
+
+At the 207-token prompt measured above, batching would cut distinct expert
+weight loads from 53,406 to 6,685. Combined with the ~4x fewer disk reads that
+implies, and N-wide GEMMs on the trunk and shared expert, the accounted time
+(disk 38.7%, attention 33.4%, expert matmul 15.4%, shared expert 7.4%) suggests
+prefill could get roughly **2-3x faster on a long prompt, and ~15% on a
+25-token one**. That is an estimate from the breakdown, not a measurement —
+the only measurements here are the timings and the reuse factors above.
+
+It is not a small change: it needs a batched variant of every matmul, batched
+attention, and the compressor's `start_pos == 0` branch, and each has to keep
+the same 16-accumulator tree per (row, token) pair to stay bit-exact.
 
 ## DeepSeek-V4-Pro
 
@@ -231,15 +320,27 @@ argued with:
 |---|---|
 | CPU | 20-core x86-64, AVX2 + FMA, no AVX-512 |
 | GPU | RTX 5060 Laptop, 8 GB, sm_120 (Blackwell), CUDA 13.3 |
-| Disk | PCIe Gen4 NVMe, 4.4 GB/s sequential O_DIRECT |
+| Disk | PCIe Gen4 NVMe, 5.3 GB/s sequential O_DIRECT when cold |
 | OS | WSL2 / Ubuntu 24.04, 23 GB available to the VM |
 
-Two caveats worth applying to every figure. Run-to-run variance on the full
-model is about **20%**, dominated by disk and thermal state — which is why
-kernel changes are measured with `bench/matmul_bw.c` rather than by timing a
-generation. And this is a laptop: the numbers here were taken on AC power in
-performance mode, after hours of sustained load, so they are if anything
-pessimistic.
+**Thermal state matters far more than previously claimed, and it is the
+biggest caveat on this page.** Every figure here was re-measured on a freshly
+rebooted, idle machine on AC power in performance mode. An earlier revision of
+this README carried the same benchmarks taken after 24+ hours of sustained
+load, and the gap is not the ±20% that revision quoted:
+
+| | heat-soaked | cold | |
+|---|---|---|---|
+| `--budget 1` | 13.7 s/tok | **4.64 s/tok** | 2.95x |
+| `--budget 16` | 2.65 s/tok | **2.21 s/tok** | 1.20x |
+| `--budget 16 --gpu` | 1.81 s/tok | **1.74 s/tok** | 1.04x |
+
+The pattern is consistent: the more disk-bound a configuration is, the more it
+loses when the machine is hot. Sequential O_DIRECT reads measure 5.3 GB/s on the
+cold machine, against 4.4 GB/s recorded during the earlier heat-soaked session,
+and the low-budget rows are almost entirely disk. So treat any single timing here as ±20% *at a fixed thermal state*, and
+up to 3x across states — which is why kernel changes are resolved with
+`bench/matmul_bw.c` rather than by timing a generation.
 
 ## Kernel throughput
 
@@ -248,10 +349,10 @@ is the scalar path against the AVX2 path — not a tolerance:
 
 | kernel | scalar | AVX2 | speedup | bitwise equal |
 |---|---|---|---|---|
-| fp4 expert w1 2048x4096 | 36.3 GF/s | **103.5 GF/s** | 2.85x | yes |
-| fp4 expert w2 4096x2048 | 41.5 GF/s | **114.3 GF/s** | 2.76x | yes |
-| fp8 attn wo_b 4096x8192 | 14.3 GF/s | 18.1 GF/s | 1.27x | yes |
-| fp8 attn wq_b 32768x1024 | 13.7 GF/s | 19.4 GF/s | 1.41x | yes |
+| fp4 expert w1 2048x4096 | 45.0 GF/s | **108.8 GF/s** | 2.42x | yes |
+| fp4 expert w2 4096x2048 | 52.2 GF/s | **115.4 GF/s** | 2.21x | yes |
+| fp8 attn wo_b 4096x8192 | 14.9 GF/s | 19.7 GF/s | 1.32x | yes |
+| fp8 attn wq_b 32768x1024 | 15.1 GF/s | 19.1 GF/s | 1.26x | yes |
 
 FP8 barely moving is the informative part: those matrices are 33.5 MB and are
 re-read from RAM every layer, so they are bandwidth-bound rather than
@@ -262,8 +363,8 @@ Per-call, including the PCIe round trip:
 
 | | GPU | CPU (AVX2) |
 |---|---|---|
-| fp8 wo_b 4096x8192 | **1.50 ms** | 3.89 ms |
-| fp8 wq_b 32768x1024 | **1.34 ms** | 3.40 ms |
+| fp8 wo_b 4096x8192 | **1.348 ms** | 3.401 ms |
+| fp8 wq_b 32768x1024 | **1.341 ms** | 3.522 ms |
 
 There is a ~1.3 ms floor per call that barely varies with size, so the GPU wins
 on the 33.5 MB matrices and loses on small ones — `wkv` is 4.2 MFLOP, which the
@@ -276,14 +377,23 @@ and busy:
 
 | | CPU throughput |
 |---|---|
-| device idle | 114.2 GF/s |
-| device busy, 20 OpenMP threads | **5.0 GF/s** — 21.7x collapse |
-| device busy, one core reserved | 113.8 GF/s — no contention |
+| device idle | 119.1 GF/s |
+| device busy, 20 OpenMP threads | **3.9 GF/s** — 30.5x collapse |
+| device busy, 20 threads, blocking sync | 5.0 GF/s — 25.1x, no better |
+| device busy, one core reserved | 118.5 GF/s — 1.00x, no contention |
 
-CUDA's default synchronisation spins, and a spinning thread on a pool that
-already has one worker per core competes with the threads it waits behind. On
-the real model that was 142 s versus 47 s. `--gpu` reserves a core
-automatically; an explicit `OMP_NUM_THREADS` is honoured instead.
+The fix is real and the explanation was wrong. This bench was written to test
+the hypothesis that CUDA's default synchronisation *spins*, so the waiting
+thread competes with the OpenMP workers it is waiting behind. Selecting
+`cudaDeviceScheduleBlockingSync` — where the thread sleeps instead — should then
+have removed the collapse. It does not: 5.0 GF/s against 3.9, a 25.1x collapse
+instead of 30.5x. So spinning is at most a small part of it, and the real cause
+is still open; DMA traffic contending for DRAM bandwidth with a memory-bound FP4
+matmul is the next suspect, unmeasured.
+
+What *is* measured is that holding one core back removes the collapse entirely,
+whichever sync mode is in use. `--gpu` reserves a core automatically; an
+explicit `OMP_NUM_THREADS` is honoured instead.
 
 ## Expert routing
 
@@ -305,18 +415,26 @@ forward passes:
 | 24 GB | 67.7% | 68.6% | 79.7% |
 
 Frequency-pinning beats LRU by ~3 points and loses at small sizes, which is why
-the policy stays LRU. Code routes more repetitively than prose — the same
+the policy stays LRU. These are cache-simulation results replayed from a stored
+trace, so unlike every timing on this page they do not move with thermal state —
+they are properties of the routing, not of the machine. Code routes more repetitively than prose — the same
 measurement on an English prompt gives a 69.9% ceiling against 83.3% here — so
 the cache pays off better on coding work.
 
 ## Benchmarks and diagnostics
 
 ```sh
-./bin/matmul_bw 15        # scalar vs AVX2 vs GPU, at real geometries
-./bin/gpu_contention spin # what a spinning CUDA thread does to OpenMP
-./bin/cache_bw            # expert read throughput, cold
+make bench                 # builds all three
+./bin/matmul_bw 15         # scalar vs AVX2 vs GPU, at real geometries
+./bin/gpu_contention spin  # CPU throughput while the device is busy
+./bin/gpu_contention block # the same with blocking sync, for comparison
+./bin/cache_bw             # expert read throughput, cold
 python3 tools/sim_cache.py route.log   # replay a routing trace vs LRU/LFU/Belady
 ```
+
+`cache_bw` is the one that explains the low-`--budget` rows: a 12.75 MB expert
+reads in **4.8 ms at 2.6 GB/s**, against 5.3 GB/s for the trunk's long
+sequential reads. One forward pass needs 258 of them.
 
 `matmul_bw` exists because the model run is a poor instrument: it takes ~70 s
 and moves ±20% with disk and thermal state, which cannot resolve a 12% kernel
@@ -333,7 +451,10 @@ Recorded so they are not rebuilt from the same wrong premise.
   of the row loop (2.8×).
 - **Layer-major prefill.** Bit-exact, and 73.6 s against a 66–70 s baseline. The
   trunk is fully pinned so there is no disk read to save, and 165 MB per layer
-  dwarfs the ~24 MB L3, so there is no cache reuse either.
+  dwarfs the ~24 MB L3, so there is no cache reuse either. (Both figures are
+  from the heat-soaked session, so they compare with each other but not with
+  the cold timings elsewhere on this page. The conclusion is a ratio, and the
+  ratio is what survives.)
 
 ## Licence
 

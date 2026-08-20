@@ -16,7 +16,7 @@ LDLIBS_EXTRA = $(CUDA_LD)
 BUILD := build
 BIN   := bin
 
-.PHONY: all test cfg-fixtures st-fixtures ref-fixtures tok-fixtures fixtures clean help
+.PHONY: all test bench cfg-fixtures st-fixtures ref-fixtures tok-fixtures fixtures clean help
 
 # EVERY binary depends on EVERY engine source and header.
 #
@@ -224,6 +224,25 @@ test: $(BIN)/test_cuda $(BIN)/test_pro $(BIN)/test_cfg $(BIN)/test_st $(BIN)/tes
 	@echo
 	@./$(BIN)/test_cuda
 
+# ------------------------------------------------------------- BENCHES ------
+# The README tells you to run these, so something has to build them. They link
+# the same objects with the same CFLAGS as the engine -- a bench built with
+# different flags measures a different program.
+BENCHBIN := $(BIN)/matmul_bw $(BIN)/gpu_contention $(BIN)/cache_bw
+bench: $(BENCHBIN)
+
+$(BIN)/matmul_bw: bench/matmul_bw.c src/core/dsv4_matmul.c $(DSV4_CUDA_OBJ)
+	@mkdir -p $(BIN)
+	$(CC) $(CFLAGS) $(INCS) bench/matmul_bw.c src/core/dsv4_matmul.c 	      $(DSV4_CUDA_SRC) $(DSV4_CUDA_OBJ) -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
+
+$(BIN)/gpu_contention: bench/gpu_contention.c src/core/dsv4_matmul.c $(DSV4_CUDA_OBJ)
+	@mkdir -p $(BIN)
+	$(CC) $(CFLAGS) $(INCS) bench/gpu_contention.c src/core/dsv4_matmul.c 	      $(DSV4_CUDA_SRC) $(DSV4_CUDA_OBJ) -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
+
+$(BIN)/cache_bw: bench/cache_bw.c src/cache/dsv4_cache.c src/io/dsv4_st.c
+	@mkdir -p $(BIN)
+	$(CC) $(CFLAGS) $(INCS) bench/cache_bw.c src/cache/dsv4_cache.c 	      src/io/dsv4_st.c -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
+
 clean:
 	rm -rf $(BUILD) $(BIN)
 
@@ -231,7 +250,9 @@ help:
 	@echo "deepseek-v4-in-c -- DeepSeek-V4 in C99, streamed off NVMe"
 	@echo ""
 	@echo "  make               build everything (CUDA auto-detected)"
-	@echo "  make test          the full gate ladder, 21 gates"
+	@echo "  make test          the gate ladder (20 gates; the trunk gate"
+	@echo "                     needs DSV4_MODEL and DSV4_TRUNK to make 21)"
+	@echo "  make bench         matmul_bw, gpu_contention, cache_bw"
 	@echo "  make clean"
 	@echo ""
 	@echo "fixtures (only needed if you change a kernel or a format):"
