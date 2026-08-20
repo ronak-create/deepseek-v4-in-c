@@ -14,6 +14,7 @@
 #include <time.h>
 
 #include "dsv4.h"
+#include "dsv4_cuda.h"
 
 void dsv4_matmul_fp8(float *, const float *, const uint8_t *, const uint8_t *,
                      int, int, int, int);
@@ -38,6 +39,7 @@ static unsigned nextr(void) { rng = rng * 1103515245u + 12345u; return rng; }
 int main(int argc, char **argv)
 {
     const int reps = argc > 1 ? atoi(argv[1]) : 20;
+    const int gpu = dsv4_cuda_available() && dsv4_cuda_init() == 0;
 
     printf("matmul throughput, Flash geometries, AVX2 %s\n",
            dsv4_matmul_has_avx2() ? "COMPILED IN" : "not available");
@@ -62,8 +64,9 @@ int main(int argc, char **argv)
         float *x = malloc((size_t)in * sizeof *x);
         float *ya = malloc((size_t)out * sizeof *ya);
         float *yb = malloc((size_t)out * sizeof *yb);
+        float *yg = malloc((size_t)out * sizeof *yg);
         uint8_t *W = malloc(wbytes), *S = malloc(sbytes);
-        if (!x || !ya || !yb || !W || !S) { printf("  out of memory\n"); return 1; }
+        if (!x || !ya || !yb || !yg || !W || !S) { printf("  out of memory\n"); return 1; }
 
         for (int i = 0; i < in; i++)
             x[i] = (float)((int)(nextr() >> 16 & 0xffff) - 32768) * 1e-3f;
@@ -96,13 +99,41 @@ int main(int argc, char **argv)
             if (t2 - t1 < tv) tv = t2 - t1;
         }
 
+        /* PER-CALL LATENCY IS THE QUESTION FOR A GEMV.
+         *
+         * A matrix-VECTOR product moves a lot of weight and very little
+         * activation, so if each offloaded call costs a fixed round trip, the
+         * GPU can lose on small matrices however fast its arithmetic is. This
+         * times a full dsv4_cuda_mmq -- H2D copy, kernel, D2H copy -- which is
+         * what the engine actually pays per call, not a kernel in isolation. */
+        double tgpu = 0.0;
+        DSV4QMat mm;
+        memset(&mm, 0, sizeof mm);
+        mm.w = W; mm.s = S; mm.wdt = job[j].fp4 ? DSV4_WFP4 : DSV4_WFP8;
+        mm.rows = out; mm.cols = in;
+        mm.blk_r = job[j].blk_r; mm.blk_c = job[j].blk_c;
+        if (gpu && dsv4_cuda_upload(&mm) == 0) {
+            dsv4_cuda_mmq(yg, x, &mm);                 /* warm */
+            tgpu = 1e30;
+            for (int r = 0; r < reps; r++) {
+                const double a0 = now();
+                dsv4_cuda_mmq(yg, x, &mm);
+                const double a1 = now() - a0;
+                if (a1 < tgpu) tgpu = a1;
+            }
+        }
+
         const int same = memcmp(ya, yb, (size_t)out * sizeof *ya) == 0;
         const double flop = 2.0 * (double)in * (double)out;
         printf("%-22s %7.1f GF %7.1f GF %7.2fx  %s\n",
                job[j].name, flop / ts * 1e-9, flop / tv * 1e-9, ts / tv,
                same ? "yes" : "NO -- THE PATHS DISAGREE");
+        if (tgpu > 0.0 && tgpu < 1e29)
+            printf("%-22s %7.1f GF  %7.3f ms/call   cpu(avx2) %7.3f ms/call\n",
+                   "  ^ gpu round trip", flop / tgpu * 1e-9,
+                   tgpu * 1e3, tv * 1e3);
 
-        free(x); free(ya); free(yb); free(W); free(S);
+        free(x); free(ya); free(yb); free(yg); free(W); free(S);
     }
     return 0;
 }

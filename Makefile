@@ -68,7 +68,7 @@ $(BIN)/test_quant: tests/unit/test_quant.c src/core/dsv4_quant.h
 
 $(BIN)/test_matmul: tests/unit/test_matmul.c src/core/dsv4_matmul.c                     src/core/dsv4_quant.h include/dsv4/dsv4.h
 	@mkdir -p $(BIN)
-	$(CC) $(CFLAGS) $(INCS) tests/unit/test_matmul.c src/core/dsv4_matmul.c 	      -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
+	$(CC) $(CFLAGS) $(INCS) tests/unit/test_matmul.c src/core/dsv4_matmul.c 	      $(DSV4_CUDA_SRC) $(DSV4_CUDA_OBJ) -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
 
 $(BIN)/test_ops: tests/unit/test_ops.c src/core/dsv4_ops.c include/dsv4/dsv4.h
 	@mkdir -p $(BIN)
@@ -98,7 +98,7 @@ DSV4_CORE := src/core/dsv4_ops.c src/core/dsv4_matmul.c src/core/dsv4_hc.c      
 
 $(BIN)/test_layer: tests/unit/test_layer.c src/model/dsv4_layer.c $(DSV4_CORE)                    src/model/dsv4_layer.h include/dsv4/dsv4.h
 	@mkdir -p $(BIN)
-	$(CC) $(CFLAGS) $(INCS) tests/unit/test_layer.c src/model/dsv4_layer.c 	      $(DSV4_CORE) -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
+	$(CC) $(CFLAGS) $(INCS) tests/unit/test_layer.c src/model/dsv4_layer.c 	      $(DSV4_CORE) $(DSV4_CUDA_SRC) $(DSV4_CUDA_OBJ) -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
 
 $(BIN)/test_cache: tests/unit/test_cache.c src/cache/dsv4_cache.c src/io/dsv4_st.c                    src/cache/dsv4_cache.h include/dsv4/dsv4.h
 	@mkdir -p $(BIN)
@@ -110,11 +110,11 @@ $(BIN)/test_bindmem: tests/unit/test_bindmem.c src/model/dsv4_bind.c src/io/dsv4
 
 $(BIN)/test_oracle: tests/unit/test_oracle.c $(DSV4_CORE)                     include/dsv4/dsv4.h third_party/json.h
 	@mkdir -p $(BIN)
-	$(CC) $(CFLAGS) $(INCS) tests/unit/test_oracle.c $(DSV4_CORE) -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
+	$(CC) $(CFLAGS) $(INCS) tests/unit/test_oracle.c $(DSV4_CORE) $(DSV4_CUDA_SRC) $(DSV4_CUDA_OBJ) -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
 
 $(BIN)/test_layer_oracle: tests/unit/test_layer_oracle.c src/model/dsv4_layer.c                           $(DSV4_CORE) src/model/dsv4_layer.h third_party/json.h
 	@mkdir -p $(BIN)
-	$(CC) $(CFLAGS) $(INCS) tests/unit/test_layer_oracle.c src/model/dsv4_layer.c 	      $(DSV4_CORE) -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
+	$(CC) $(CFLAGS) $(INCS) tests/unit/test_layer_oracle.c src/model/dsv4_layer.c 	      $(DSV4_CORE) $(DSV4_CUDA_SRC) $(DSV4_CUDA_OBJ) -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
 
 $(BIN)/test_trunk: tests/unit/test_trunk.c src/io/dsv4_trunk.c src/io/dsv4_st.c                    src/model/dsv4_bind.c src/io/dsv4_trunk.h
 	@mkdir -p $(BIN)
@@ -136,7 +136,10 @@ tok-fixtures:
 # sm_120 is the RTX 5060's Blackwell architecture and needs CUDA 12.8+. The
 # real cc is passed through so the host half of the .cu sees the same compiler
 # the rest of the engine is built with.
-NVCC := $(shell command -v nvcc 2>/dev/null)
+# Look on PATH first, then the standard install location -- the CUDA packages
+# do not put nvcc on PATH, and requiring every caller to export it is a good way
+# to get a silently CPU-only build that nobody notices.
+NVCC := $(shell command -v nvcc 2>/dev/null || ls /usr/local/cuda/bin/nvcc 2>/dev/null)
 ifeq ($(NVCC),)
   DSV4_CUDA_SRC := src/cuda/dsv4_cuda_stub.c
   DSV4_CUDA_OBJ :=
@@ -145,7 +148,10 @@ else
   DSV4_CUDA_SRC :=
   DSV4_CUDA_OBJ := $(BUILD)/dsv4_cuda.o
   CUDA_ARCH ?= sm_120
-  CUDA_LD := -L$(dir $(shell readlink -f $(NVCC)))../lib64 -lcudart
+  # -lstdc++ because the nvcc-compiled object pulls in the C++ runtime (guard
+  # variables for function-local statics), and the rest of the engine is linked
+  # by cc, which would not add it.
+  CUDA_LD := -L$(dir $(shell readlink -f $(NVCC)))../lib64 -lcudart -lstdc++
   CFLAGS += -DDSV4_HAVE_CUDA
 endif
 
