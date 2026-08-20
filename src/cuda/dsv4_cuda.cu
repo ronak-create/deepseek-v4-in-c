@@ -121,6 +121,8 @@ typedef struct {
 static Res  *g_res;
 static int   g_nres, g_cap;
 static float *g_x, *g_y;         /* device activation staging */
+static float *g_hx, *g_hy;       /* PINNED host staging -- see dsv4_cuda_mmq */
+static int    g_hxcap, g_hycap;
 static int    g_xcap, g_ycap;
 static int    g_ready;
 
@@ -128,6 +130,20 @@ extern "C" int dsv4_cuda_available(void)
 {
     int n = 0;
     return (cudaGetDeviceCount(&n) == cudaSuccess && n > 0) ? 1 : 0;
+}
+
+/* Choose how the calling thread waits for the device. MUST be called before any
+ * context exists, i.e. before dsv4_cuda_init.
+ *
+ * The default is cudaDeviceScheduleSpin: the thread busy-waits. That is the
+ * right default for a process whose CPU is otherwise idle, and the wrong one
+ * here -- every core is already running an OpenMP worker on the routed experts,
+ * so a spinning thread competes with the work it is waiting behind. */
+extern "C" int dsv4_cuda_set_blocking_sync(void)
+{
+    CUDA_TRY(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync),
+             "cudaSetDeviceFlags");
+    return 0;
 }
 
 extern "C" int dsv4_cuda_init(void)
@@ -216,6 +232,33 @@ static int stage(int in, int out)
             { g_y = NULL; g_ycap = 0; return -1; }
         g_ycap = out;
     }
+    /* PINNED HOST STAGING, allocated once and reused.
+     *
+     * Copying straight from the caller's pageable buffer looks simpler and is
+     * catastrophic here: the driver has to page-lock those pages for the DMA
+     * and release them afterwards, on every single call. That work is not local
+     * to the calling thread -- changing the process page tables forces TLB
+     * shootdown IPIs across every core, and this engine has an OpenMP worker
+     * pinned to all of them crunching routed experts.
+     *
+     * Measured with bench/gpu_contention.c: with pageable copies, CPU-side FP4
+     * matmul fell from 114 GF/s to 3.6 GF/s while the device was busy -- 32x,
+     * and only 23x with blocking sync, which is how we knew spinning was not
+     * the real cause. */
+    if (in > g_hxcap) {
+        if (g_hx) cudaFreeHost(g_hx);
+        if (cudaHostAlloc((void **)&g_hx, (size_t)in * sizeof(float),
+                          cudaHostAllocDefault) != cudaSuccess)
+            { g_hx = NULL; g_hxcap = 0; return -1; }
+        g_hxcap = in;
+    }
+    if (out > g_hycap) {
+        if (g_hy) cudaFreeHost(g_hy);
+        if (cudaHostAlloc((void **)&g_hy, (size_t)out * sizeof(float),
+                          cudaHostAllocDefault) != cudaSuccess)
+            { g_hy = NULL; g_hycap = 0; return -1; }
+        g_hycap = out;
+    }
     return 0;
 }
 
@@ -227,10 +270,14 @@ extern "C" void dsv4_cuda_mmq(float *y, const float *x, const DSV4QMat *m)
                         "resident\n");
         abort();
     }
-    cudaMemcpy(g_x, x, (size_t)r->cols * sizeof(float), cudaMemcpyHostToDevice);
+    memcpy(g_hx, x, (size_t)r->cols * sizeof(float));
+    cudaMemcpy(g_x, g_hx, (size_t)r->cols * sizeof(float),
+               cudaMemcpyHostToDevice);
     k_mmq_fp8<<<r->rows, 128>>>(g_y, g_x, r->dw, r->ds,
                                 r->cols, r->blk_r, r->blk_c, r->sc);
-    cudaMemcpy(y, g_y, (size_t)r->rows * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(g_hy, g_y, (size_t)r->rows * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    memcpy(y, g_hy, (size_t)r->rows * sizeof(float));
 }
 
 extern "C" void dsv4_cuda_shutdown(void)
@@ -242,7 +289,10 @@ extern "C" void dsv4_cuda_shutdown(void)
     free(g_res); g_res = NULL; g_nres = g_cap = 0;
     if (g_x) cudaFree(g_x);
     if (g_y) cudaFree(g_y);
-    g_x = g_y = NULL; g_xcap = g_ycap = 0;
+    if (g_hx) cudaFreeHost(g_hx);
+    if (g_hy) cudaFreeHost(g_hy);
+    g_x = g_y = g_hx = g_hy = NULL;
+    g_xcap = g_ycap = g_hxcap = g_hycap = 0;
     g_ready = 0;
 }
 

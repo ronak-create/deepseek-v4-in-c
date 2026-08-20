@@ -29,6 +29,8 @@
 #include "dsv4_trunk.h"
 #include "dsv4_cache.h"
 #include "dsv4_layer.h"
+#include <omp.h>
+
 #include "dsv4_cuda.h"
 #include "dsv4_tok.h"
 
@@ -184,6 +186,30 @@ int main(int argc, char **argv)
         } else if (dsv4_cuda_init() != 0) {
             fprintf(stderr, "--gpu: device init failed; running on the CPU\n");
         } else {
+            /* LEAVE ONE CORE FOR THE DEVICE THREAD.
+             *
+             * This single line was worth 2.9x. CUDA's default synchronisation
+             * spins, and a spinning thread on a pool that already has one
+             * OpenMP worker per core does not merely add load -- it competes
+             * with the very threads it waits behind. Measured with
+             * bench/gpu_contention.c: CPU-side FP4 matmul fell from 114 GF/s to
+             * 5 GF/s while the device was busy, a 21.7x collapse, and it went
+             * to 0.99x -- no contention whatever -- as soon as one core was
+             * held back. On the real model that was 142.4 s against 49.3 s.
+             *
+             * It cost a wrong conclusion first: the collapse was blamed on PCIe
+             * latency and on a laptop power envelope, and neither was it.
+             *
+             * An explicit OMP_NUM_THREADS is left alone -- if someone has
+             * chosen a thread count, that is not ours to override. */
+            if (!getenv("OMP_NUM_THREADS")) {
+                const int n = omp_get_max_threads();
+                if (n > 1) {
+                    omp_set_num_threads(n - 1);
+                    printf("gpu: reserving 1 of %d cores for the device "
+                           "thread\n", n);
+                }
+            }
             const size_t before = dsv4_cuda_free_vram();
             for (int L = 0; L < tr.npin; L++) {
                 DSV4LayerBind lb;

@@ -20,6 +20,7 @@ void   dsv4_cuda_shutdown(void)                { }
  * host's. Without a device there is nothing to dump, and the gate skips long
  * before it would call this. */
 int dsv4_cuda_dump_e4m3(float *host256) { (void)host256; return -1; }
+int dsv4_cuda_set_blocking_sync(void) { return -1; }
 
 void dsv4_cuda_mmq(float *y, const float *x, const DSV4QMat *m)
 {
