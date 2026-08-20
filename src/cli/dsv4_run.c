@@ -96,7 +96,7 @@ static void hc_head(float *y, const float *x, const DSV4HcW *w,
 
 static void usage(const char *me)
 {
-    printf("usage: %s <model_dir> --trunk <dir> --tok <file> "
+    printf("usage: %s <model_dir | --model DIR> --trunk <dir> --tok <file> "
            "[--prompt TEXT] [--gen N] [--budget GB] [--route-log FILE] [--gpu]\n", me);
 }
 
@@ -111,6 +111,11 @@ int main(int argc, char **argv)
 
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-' && !model)      { model = argv[i]; continue; }
+        /* --model is an alias for the positional form. Both are accepted
+         * because "point it at a model" is the obvious mental model, and a
+         * tool that only takes the directory positionally invites exactly the
+         * wrong guess. */
+        else if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
         if (!strcmp(argv[i], "--trunk")  && i + 1 < argc) trunkdir = argv[++i];
         else if (!strcmp(argv[i], "--tok")   && i + 1 < argc) tokfile = argv[++i];
         else if (!strcmp(argv[i], "--prompt")&& i + 1 < argc) prompt  = argv[++i];
