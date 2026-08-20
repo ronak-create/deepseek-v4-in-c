@@ -15,6 +15,7 @@
 #include "json.h"
 
 int     dsv4_tok_load(DSV4Tok *, const char *);
+int32_t dsv4_tok_find(const DSV4Tok *, const char *, int);
 void    dsv4_tok_free(DSV4Tok *);
 int     dsv4_tok_encode(const DSV4Tok *, const char *, int, int32_t *, int);
 
@@ -109,6 +110,68 @@ int main(void)
 
     dsv4_tok_free(&t);
     printf("\n  %d of %d cases match exactly\n", cases_ok, cases_run);
+    printf("\n-- GATE  chat special tokens survive as SINGLE ids --\n");
+    {
+        /* <U+FF5C>User<U+FF5C> is ONE id, and the merge table contains nothing
+         * that would rebuild it from pieces -- so it has to be matched before
+         * the regex pre-tokeniser ever sees it. It was not, and the cost was
+         * invisible: this exact prompt tokenised to 37 ids instead of 17, the
+         * model never saw a turn boundary, and it answered by continuing the
+         * text rather than by being an assistant. Fluent, and wrong.
+         *
+         * Ids come from the checkpoint's own tokenizer.json via HF tokenizers. */
+        static const int32_t want[] = {
+            0, 3476, 477, 260, 11502, 22896, 603, 128803,
+            3085, 344, 223, 20, 13, 20, 33, 128804, 128822
+        };
+        const char *p =
+            "<\uff5cbegin\u2581of\u2581sentence\uff5c>You are a helpful "
+            "assistant.\n<\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c>"
+            "</think>";
+        const char *eos_s = "<\uff5cend\u2581of\u2581sentence\uff5c>";
+        int32_t got[256];
+        /* The fixture packs a REDUCED vocab, which cannot express this case at
+         * all -- its added ids point past its own table. Decide on vocab size
+         * rather than by looking a token up, because the lookup is what is
+         * unsafe on a reduced table. */
+        /* Use the REAL packed tokenizer when one is pointed at, so this is an
+         * assertion rather than a skip. On this machine:
+         *   DSV4_TOK=~/dsv4_tok.bin make test */
+        DSV4Tok rt; const char *rtp = getenv("DSV4_TOK");
+        int have = 0;
+        if (rtp && dsv4_tok_load(&rt, rtp) == 0 && rt.n_vocab >= 129280u) have = 1;
+        const DSV4Tok *use = have ? &rt : &t;
+        if (!have) {
+            printf("  SKIP  this fixture has a reduced vocab without the "
+                   "chat specials; the real check is the CLI\n"
+                   "        at 17 ids, see README.\n");
+        } else {
+        const int n  = dsv4_tok_encode(use, p, (int)strlen(p), got, 256);
+        const int wn = (int)(sizeof want / sizeof want[0]);
+        int bad = 0;
+
+        if (n != wn) {
+            printf("  FAIL  chat prompt gave %d ids, reference gives %d\n", n, wn);
+            fails++; bad++;
+        }
+        for (int k = 0; k < n && k < wn; k++)
+            if (got[k] != want[k]) {
+                if (bad < 3)
+                    printf("  FAIL  id[%d] = %d, expected %d\n", k, got[k], want[k]);
+                bad++; fails++;
+            }
+
+        /* The end-of-turn id, which the CLI looks up so it knows when to stop
+         * instead of hardcoding 1. */
+        const int32_t eos = dsv4_tok_find(use, eos_s, (int)strlen(eos_s));
+        if (eos != 1) {
+            printf("  FAIL  end-of-sentence id is %d, expected 1\n", eos);
+            fails++; bad++;
+        }
+        if (!bad) printf("  ok    %d ids, atomic specials, eos = %d\n", n, eos);
+        }
+    }
+
     if (fails) { printf("TOKENIZER GATE FAILED: %d case(s)\n", fails); return 1; }
     printf("TOKENIZER GATE PASSED\n");
     return 0;

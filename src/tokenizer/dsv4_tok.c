@@ -290,8 +290,8 @@ static int split_stage2(const char *s, const Piece *in, int nin,
 
 #define MAXSYM 4096
 
-int dsv4_tok_encode(const DSV4Tok *t, const char *text, int n,
-                    int32_t *ids, int max_ids)
+static int encode_plain(const DSV4Tok *t, const char *text, int n,
+                        int32_t *ids, int max_ids)
 {
     if (n <= 0) return 0;
 
@@ -343,3 +343,96 @@ int dsv4_tok_encode(const DSV4Tok *t, const char *text, int n,
     }
     return nids;
 }
+
+/* ------------------------------------------------- added / special tokens ---
+ * Added tokens must be matched BEFORE the regex pre-tokenizer ever sees them.
+ *
+ * They are not BPE material: <｜User｜> is one id, atomically, and the merge
+ * table contains nothing that would ever rebuild it from pieces. Feeding it
+ * through the normal path shatters it into ordinary text -- measured, the chat
+ * prompt "<｜begin▁of▁sentence｜>You are a helpful assistant.\n<｜User｜>What
+ * is 2+2?<｜Assistant｜></think>" came out as 37 ids where the reference
+ * tokenizer gives 17. The model then never sees a turn boundary at all, which
+ * is a silent failure: it still generates fluent text, just not as an
+ * assistant answering a question.
+ *
+ * The scan is indexed by first byte, so ordinary prose costs one comparison per
+ * character rather than 1,283. Longest match wins within a bucket, because
+ * <｜User｜> and any hypothetical <｜User must not be ambiguous. */
+static int32_t  g_add_head[256];
+static int32_t *g_add_next;
+static const DSV4Tok *g_add_for;
+
+static void build_added_index(const DSV4Tok *t)
+{
+    if (g_add_for == t) return;
+    free(g_add_next);
+    g_add_next = (int32_t *)malloc((size_t)t->n_added * sizeof *g_add_next);
+    if (!g_add_next) { g_add_for = NULL; return; }
+    for (int i = 0; i < 256; i++) g_add_head[i] = -1;
+
+    /* Insert so that each bucket ends up sorted by DESCENDING length: walk the
+     * ids by increasing length and push each to the front. */
+    int32_t *order = (int32_t *)malloc((size_t)t->n_added * sizeof *order);
+    if (!order) { free(g_add_next); g_add_next = NULL; g_add_for = NULL; return; }
+    /* Only added ids that actually exist in THIS vocab. A reduced tokenizer --
+     * the test fixture is one -- can carry added ids from the full vocab that
+     * are past its own n_vocab, and indexing vlen[] with those reads off the
+     * end of the table. It segfaulted the tokenizer gate. */
+    uint32_t nord = 0;
+    for (uint32_t i = 0; i < t->n_added; i++)
+        if (t->added[i] < t->n_vocab) order[nord++] = (int32_t)i;
+    for (uint32_t i = 1; i < nord; i++) {                /* insertion sort */
+        const int32_t v = order[i];
+        const uint16_t lv = t->vlen[t->added[v]];
+        int32_t j = (int32_t)i - 1;
+        while (j >= 0 && t->vlen[t->added[order[j]]] > lv) { order[j+1] = order[j]; j--; }
+        order[j+1] = v;
+    }
+    for (uint32_t k = 0; k < nord; k++) {
+        const int32_t slot = order[k];
+        const uint32_t id = t->added[slot];
+        if (t->vlen[id] == 0) continue;                  /* holes: unreachable */
+        const unsigned char first = (unsigned char)t->blob[t->voff[id]];
+        g_add_next[slot] = g_add_head[first];
+        g_add_head[first] = slot;
+    }
+    free(order);
+    g_add_for = t;
+}
+
+/* The added-token id starting at text[i], or -1. */
+static int32_t match_added(const DSV4Tok *t, const char *text, int i, int n)
+{
+    const unsigned char first = (unsigned char)text[i];
+    for (int32_t s = g_add_head[first]; s >= 0; s = g_add_next[s]) {
+        const uint32_t id = t->added[s];
+        const int len = (int)t->vlen[id];
+        if (len <= n - i && memcmp(text + i, t->blob + t->voff[id], (size_t)len) == 0)
+            return (int32_t)id;
+    }
+    return -1;
+}
+
+int dsv4_tok_encode(const DSV4Tok *t, const char *text, int n,
+                    int32_t *ids, int max_ids)
+{
+    if (n <= 0) return 0;
+    build_added_index(t);
+    if (g_add_for != t) return encode_plain(t, text, n, ids, max_ids);
+
+    int nids = 0, seg = 0;
+    for (int i = 0; i < n && nids < max_ids; ) {
+        const int32_t id = match_added(t, text, i, n);
+        if (id < 0) { i++; continue; }
+        if (i > seg)
+            nids += encode_plain(t, text + seg, i - seg, ids + nids, max_ids - nids);
+        if (nids < max_ids) ids[nids++] = id;
+        i  += (int)t->vlen[id];
+        seg = i;
+    }
+    if (n > seg && nids < max_ids)
+        nids += encode_plain(t, text + seg, n - seg, ids + nids, max_ids - nids);
+    return nids;
+}
+

@@ -40,6 +40,9 @@ void dsv4_rope_table(float *, float *, int, int, int, double, double, double, do
 int  dsv4_tok_load(DSV4Tok *, const char *);
 void dsv4_tok_free(DSV4Tok *);
 int  dsv4_tok_encode(const DSV4Tok *, const char *, int, int32_t *, int);
+/* Exact-string lookup, so the end-of-turn id is read from the tokenizer
+ * rather than hardcoded to 1. */
+int32_t dsv4_tok_find(const DSV4Tok *, const char *, int);
 
 /* The expert source every layer is handed. The cache travels through ctx rather
  * than a file-scope global, so two models could run in one process. */
@@ -97,14 +100,16 @@ static void hc_head(float *y, const float *x, const DSV4HcW *w,
 static void usage(const char *me)
 {
     printf("usage: %s <model_dir | --model DIR> --trunk <dir> --tok <file> "
-           "[--prompt TEXT] [--gen N] [--budget GB] [--route-log FILE] [--gpu]\n", me);
+           "[--prompt TEXT] [--gen N] [--budget GB] [--route-log FILE]\n"
+           "       [--gpu] [--chat] [--think] [--system TEXT]\n", me);
 }
 
 int main(int argc, char **argv)
 {
     const char *model = NULL, *trunkdir = NULL, *tokfile = NULL;
     const char *routelog = NULL;
-    int use_gpu = 0;
+    int use_gpu = 0, chat = 0, think = 0;
+    const char *sysprompt = NULL;
     const char *prompt = "The capital of France is";
     int ngen = 8;
     double budget_gb = 8.0;
@@ -123,6 +128,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--budget")&& i + 1 < argc) budget_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--route-log") && i + 1 < argc) routelog = argv[++i];
         else if (!strcmp(argv[i], "--gpu")) use_gpu = 1;
+        else if (!strcmp(argv[i], "--chat")) chat = 1;
+        else if (!strcmp(argv[i], "--think")) { chat = 1; think = 1; }
+        else if (!strcmp(argv[i], "--system") && i + 1 < argc) { sysprompt = argv[++i]; chat = 1; }
         else if (!strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
     }
     if (!model || !trunkdir || !tokfile) { usage(argv[0]); return 2; }
@@ -280,9 +288,33 @@ int main(int argc, char **argv)
 
     DSV4ExpertSrc src = { dsv4_run_get_expert, dsv4_run_get_experts, &cache };
 
+    /* ---- chat encoding, per the checkpoint's own encoding/README.md ----
+     *
+     *   <BOS>{system}NL<User>{msg}<Assistant>{</think> or <think>}
+     *
+     * In chat mode </think> closes the reasoning block immediately so the model
+     * answers directly; in thinking mode <think> opens it and it reasons first.
+     * Without this the model never sees a turn boundary and simply continues
+     * the text -- fluent, and not an answer.
+     *
+     * The special tokens must survive tokenisation atomically, which is why
+     * dsv4_tok_encode matches added tokens before the pre-tokeniser runs. */
+    static char chatbuf[65536];
+    if (chat) {
+        snprintf(chatbuf, sizeof chatbuf, "%s%s%s%s%s%s%s",
+                 DSV4_BOS, sysprompt ? sysprompt : "", sysprompt ? "\n" : "",
+                 DSV4_USER, prompt, DSV4_ASSISTANT,
+                 think ? DSV4_THINK_OPEN : DSV4_THINK_CLOSE);
+        prompt = chatbuf;
+    }
+
     int32_t ids[8192];
     const int nprompt = dsv4_tok_encode(&tok, prompt, (int)strlen(prompt),
                                         ids, 8192);
+    /* The end-of-turn id, looked up rather than hardcoded: it is 1 in this
+     * checkpoint, and a checkpoint that numbered it differently would otherwise
+     * never stop. */
+    const int32_t eos_id = dsv4_tok_find(&tok, DSV4_EOS, (int)strlen(DSV4_EOS));
     printf("\nprompt: \"%s\"  -> %d tokens\n", prompt, nprompt);
     if (nprompt == 0) { fprintf(stderr, "empty prompt\n"); return 1; }
 
@@ -342,6 +374,10 @@ int main(int argc, char **argv)
             printf(" %d", best);
             fflush(stdout);
             ntok++;
+            /* STOP AT THE END OF THE TURN. Without this the model runs past its
+             * own answer and keeps inventing conversation, which reads as a
+             * broken engine rather than a missing stop condition. */
+            if (eos_id >= 0 && best == eos_id) { printf("  <eos>"); break; }
         }
     }
     const double dt = now_s() - t0;

@@ -1,8 +1,11 @@
 # deepseek-v4-in-c
 
 DeepSeek-V4 in C99, running a checkpoint far larger than RAM by streaming it off
-NVMe. Flash (284B parameters, ~160 GB on disk) runs on a laptop in **18 GB of
-RAM at 1.81 s/token**.
+NVMe. Flash (284B parameters, ~160 GB on disk) runs on a laptop from **3.2 GB of
+RAM**, and at **1.81 s/token** when given 18 GB and the GPU.
+
+It is the instruct model, so it holds a conversation and writes code — see
+[Chat and code](#chat-and-code).
 
 The streaming design is ported from Fareed Khan's
 [kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c) (Apache-2.0),
@@ -17,6 +20,8 @@ written from DeepSeek's own reference implementation.
 |---|---|
 | DeepSeek-V4-Flash, CPU | ✅ 2.65 s/token |
 | DeepSeek-V4-Flash, `--gpu` | ✅ 1.81 s/token |
+| Smallest machine it runs on | ✅ **3.23 GB peak RSS** |
+| Chat + tool-call encoding | ✅ `--chat`, stops at end-of-turn |
 | DeepSeek-V4-Pro | ⚠️ planned and gated, never run — needs ~865 GB of disk |
 | Gates | 21, all green (`make test`) |
 
@@ -93,6 +98,22 @@ python3 tools/pack_tokenizer.py ~/models/dsv4-flash ~/dsv4_tok.bin
 | `--gpu` | put the dense trunk's FP8 matrices in VRAM (opt-in) |
 | `--route-log FILE` | record every expert request, for `tools/sim_cache.py` |
 
+### It scales down to 3.2 GB
+
+Every row below produces **identical tokens** — the budget buys speed, never
+correctness. Measured on Flash, same prompt:
+
+| `--budget` | peak RAM | s/token | layers pinned |
+|---|---|---|---|
+| 1 GB | **3.23 GB** | 13.7 | 5 / 43 |
+| 2 GB | 4.23 GB | 12.6 | 12 / 43 |
+| 4 GB | 6.23 GB | 11.6 | 25 / 43 |
+| 8 GB | 10.08 GB | 9.3 | 43 / 43 |
+| 16 GB + `--gpu` | 18.2 GB | **1.81** | 43 / 43 |
+
+(The slower rows are short runs, so cold-cache cost is spread over fewer
+tokens; treat them as an upper bound on what a small machine pays.)
+
 ### Choose `--budget` deliberately
 
 This is the setting that matters most, and the default is not enough for Flash.
@@ -111,6 +132,48 @@ The budget covers the trunk *and* the cache. Flash's trunk is 6.27 GB, so:
 | **16 GB** | 9.6 GB | **53%** | 61 GB |
 
 The engine prints a warning naming the threshold when you are under it.
+
+## Chat and code
+
+`DeepSeek-V4-Flash` is the **instruct** model — it does multi-turn chat, tool
+calling and extended thinking. The prompt format is not in `tokenizer_config.json`
+where most tools look; it lives in the checkpoint's own `encoding/encoding_dsv4.py`.
+`--chat` applies it for you:
+
+```sh
+./bin/dsv4 ~/models/dsv4-flash --trunk ~/dsv4-trunk --tok ~/dsv4_tok.bin \
+    --chat --system "You are a helpful coding assistant." \
+    --prompt "Write a Python function that reverses a string. Reply with only the code." \
+    --gen 120 --budget 16 --gpu
+```
+
+```
+def reverse_string(s):
+    return s[::-1]
+```
+
+It stopped there, at the end-of-turn token, in 12 tokens.
+
+`--think` opens a `<think>` block instead, so the model reasons before
+answering. Both stop at `<｜end▁of▁sentence｜>`, whose id is looked up from the
+tokenizer rather than hardcoded.
+
+**Two things the special tokens taught us.** `<｜User｜>` is a single id, and the
+BPE merge table contains nothing that would rebuild it from pieces — so it has
+to be matched *before* the regex pre-tokeniser sees it. It was not, and the
+prompt above tokenised to 37 ids instead of 17. The model never saw a turn
+boundary and answered by continuing the text: fluent, and not an assistant.
+There is now a gate on it.
+
+For a code-completion measurement, a binary search written by the model passed
+**2000 random cases against Python's own `list.index`** plus the empty-list and
+not-found edges. Routing over that run: 35,088 expert requests, all served, 46%
+cache hits, with an 83.3% reuse ceiling — code routes more repetitively than
+prose, so the cache pays off better on it.
+
+Not included: a tool-calling loop. The model emits DSML tool blocks and the
+format is documented in `encoding/README.md`, but driving them is a layer above
+this CLI.
 
 ## Where the time goes
 

@@ -59,6 +59,17 @@
 
 #define DSV4_TOK_MAGIC "DSV4TOK"
 
+/* The chat special tokens, spelled exactly as encoding/encoding_dsv4.py does.
+ * The bars are U+FF5C FULLWIDTH VERTICAL LINE and the underscores are U+2581,
+ * not ASCII -- typing them by eye is how you get a prompt that tokenises into
+ * ordinary text and a model that never realises it is in a conversation. */
+#define DSV4_BOS         "<｜begin▁of▁sentence｜>"
+#define DSV4_EOS         "<｜end▁of▁sentence｜>"
+#define DSV4_USER        "<｜User｜>"
+#define DSV4_ASSISTANT   "<｜Assistant｜>"
+#define DSV4_THINK_OPEN  "<think>"
+#define DSV4_THINK_CLOSE "</think>"
+
 typedef struct {
     uint32_t *voff;      /* [n_vocab] offset into blob                 */
     uint16_t *vlen;      /* [n_vocab] byte length                      */
