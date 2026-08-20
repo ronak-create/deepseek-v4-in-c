@@ -37,11 +37,22 @@
 #include "dsv4_st.h"
 #include "dsv4_bind.h"
 
+/* Slack so each coalesced run can be positioned at the 4096 residue its FILE
+ * offset demands, which is what lets O_DIRECT land straight in the slot. At
+ * most two runs in practice (scales, then weights); four runs' worth is bought
+ * so the placement never has to think about it. */
+#define DSV4_SLOT_SLACK (6 * 4096)
+
 typedef struct {
     int      layer, expert;    /* key; layer < 0 means the slot is empty */
     uint64_t stamp;            /* for LRU */
     DSV4ExpertW w;             /* points into `bytes` */
-    unsigned char *bytes;
+    unsigned char *bytes;      /* 4096-aligned; O_DIRECT reads land here */
+    /* Where each of the six tensors ended up in `bytes`, in the order
+     * (w1.s, w2.s, w3.s, w1.w, w2.w, w3.w). Not a constant layout any more:
+     * a run is placed wherever its file offset's alignment residue requires,
+     * so this is recomputed on every load and bind_slot reads it. */
+    int64_t  toff[6];
 } DSV4Slot;
 
 typedef struct {
@@ -55,15 +66,27 @@ typedef struct {
     /* Offsets of the six tensors inside a slot, computed once. */
     int64_t  off_w[3], off_s[3];
     int64_t  len_w[3], len_s[3];
+    /* Bytes actually allocated per slot: the payload plus DSV4_SLOT_SLACK.
+     * expert_bytes stays the true payload size so the "GB read from disk"
+     * accounting keeps meaning what it says. */
+    int64_t  slot_bytes;
 
-    /* One 4096-aligned staging buffer for O_DIRECT reads.
+    /* One 4096-aligned staging buffer per thread, now only a FALLBACK.
      *
      * O_DIRECT needs the offset, the length AND the buffer all aligned, so a
      * read is widened outward to the enclosing window and the payload starts
-     * somewhere inside it. The slot cannot receive that directly -- its run
-     * offsets are not aligned -- so the window lands here and the payload is
-     * copied across. One 12 MB memcpy at ~10 GB/s costs ~1 ms against the ~10 ms
-     * the unbuffered read saves.
+     * somewhere inside it. This used to mean every run landed here and was then
+     * memcpy'd into the slot -- and that copy was NOT the rounding error the
+     * old comment here claimed. Measured 2026-08-20: the drive does a 12.75 MB
+     * O_DIRECT read in 2.81 ms, while the engine was taking 3.60 ms per expert.
+     * The ~0.8 ms difference was the memcpy, ~4 s of a 45 s run.
+     *
+     * So the slot is now allocated 4096-aligned with DSV4_SLOT_SLACK to spare,
+     * and each run is placed at the offset whose residue matches its file
+     * offset -- then the widened window is read STRAIGHT INTO THE SLOT and the
+     * payload is already where it belongs. The staging buffer survives only for
+     * the case where a placement would not fit, which the slack is sized to
+     * prevent.
      *
      * ONE PER THREAD. Expert loads within a layer ARE issued concurrently --
      * see dsv4_cache_get_many -- so a single shared staging buffer would have
@@ -94,6 +117,11 @@ typedef struct {
  * GB) lets the trunk swallow the whole budget and the cache is left below the
  * minimum it needs to serve a single layer. */
 int64_t dsv4_cache_expert_bytes(const DSV4Cfg *cfg);
+
+/* What one slot actually COSTS: the payload plus the alignment slack that lets
+ * an O_DIRECT read land in it without a copy. This, not expert_bytes, is the
+ * figure a budget has to be divided by -- the slack is real resident memory. */
+int64_t dsv4_cache_slot_bytes(const DSV4Cfg *cfg);
 
 int  dsv4_cache_init(DSV4Cache *c, const DSV4St *st, const DSV4Cfg *cfg,
                      int64_t budget_bytes);

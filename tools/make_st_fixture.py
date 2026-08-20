@@ -74,12 +74,11 @@ TENSORS = [
     ("layers.2.ffn.gate.weight",                    "BF16",    [256, 4096]),
     ("layers.2.ffn.gate.tid2eid",                   "I64",     [512, 6]),
     ("layers.2.ffn_norm.weight",                    "BF16",    [4096]),
-    # one routed expert: FP4 packed 2-per-byte, exposed as I8, scales 1x32
-    ("layers.2.ffn.experts.0.w1.weight",            "I8",      [2048, 2048]),
+    # One routed expert: FP4 packed 2-per-byte, exposed as I8, scales 1x32.
+    # Only the SCALES here -- the weights are emitted far below. See the note on
+    # expert layout at the end of this list.
     ("layers.2.ffn.experts.0.w1.scale",             "F8_E8M0", [2048, 128]),
-    ("layers.2.ffn.experts.0.w2.weight",            "I8",      [4096, 1024]),
     ("layers.2.ffn.experts.0.w2.scale",             "F8_E8M0", [4096, 64]),
-    ("layers.2.ffn.experts.0.w3.weight",            "I8",      [2048, 2048]),
     ("layers.2.ffn.experts.0.w3.scale",             "F8_E8M0", [2048, 128]),
 
 
@@ -123,11 +122,8 @@ TENSORS = [
     # A routed expert on a SECOND layer, so the cache gate can hold two distinct
     # entries and observe eviction order. One expert per layer is enough: the
     # cache keys on (layer, expert) and never on tensor content.
-    ("layers.3.ffn.experts.0.w1.weight",            "I8",      [2048, 2048]),
     ("layers.3.ffn.experts.0.w1.scale",             "F8_E8M0", [2048, 128]),
-    ("layers.3.ffn.experts.0.w2.weight",            "I8",      [4096, 1024]),
     ("layers.3.ffn.experts.0.w2.scale",             "F8_E8M0", [4096, 64]),
-    ("layers.3.ffn.experts.0.w3.weight",            "I8",      [2048, 2048]),
     ("layers.3.ffn.experts.0.w3.scale",             "F8_E8M0", [2048, 128]),
 ]
 
@@ -143,13 +139,37 @@ TENSORS = [
 # that in one expression is exactly how the two grids get confused.
 for _e in range(1, 6):
     TENSORS += [
-        ("layers.2.ffn.experts.%d.w1.weight" % _e, "I8",      [2048, 2048]),
         ("layers.2.ffn.experts.%d.w1.scale"  % _e, "F8_E8M0", [2048, 128]),
-        ("layers.2.ffn.experts.%d.w2.weight" % _e, "I8",      [4096, 1024]),
         ("layers.2.ffn.experts.%d.w2.scale"  % _e, "F8_E8M0", [4096, 64]),
-        ("layers.2.ffn.experts.%d.w3.weight" % _e, "I8",      [2048, 2048]),
         ("layers.2.ffn.experts.%d.w3.scale"  % _e, "F8_E8M0", [2048, 128]),
     ]
+
+# AN EXPERT IS TWO SEPARATED RUNS ON DISK, AND THAT IS THE WHOLE POINT.
+#
+# The released checkpoint does NOT store an expert's six tensors together. All
+# three scales sit in one contiguous run, and the three weights sit in another
+# ~341 MB away, at a DIFFERENT 4096 alignment residue (measured on Flash shard 4:
+# scales at residue 1176, weights at 2712). dsv4_cache coalesces by file offset,
+# so a real expert always loads as two runs, and the O_DIRECT window for the
+# second one starts before its payload and can reach back over the first.
+#
+# An earlier version of this fixture emitted the six interleaved and contiguous,
+# which collapsed to ONE run. Every cache gate passed while the engine silently
+# corrupted every expert it loaded from the real checkpoint. So the weights go
+# here, after everything else, with odd-sized tensors in between to keep the two
+# residues different -- the fixture is only useful to the extent that it has the
+# shape of the thing it stands in for.
+for _e in range(0, 6):
+    TENSORS += [
+        ("layers.2.ffn.experts.%d.w1.weight" % _e, "I8",      [2048, 2048]),
+        ("layers.2.ffn.experts.%d.w2.weight" % _e, "I8",      [4096, 1024]),
+        ("layers.2.ffn.experts.%d.w3.weight" % _e, "I8",      [2048, 2048]),
+    ]
+TENSORS += [
+    ("layers.3.ffn.experts.0.w1.weight",            "I8",      [2048, 2048]),
+    ("layers.3.ffn.experts.0.w2.weight",            "I8",      [4096, 1024]),
+    ("layers.3.ffn.experts.0.w3.weight",            "I8",      [2048, 2048]),
+]
 
 
 ELEMSIZE = {

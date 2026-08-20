@@ -177,7 +177,7 @@ int main(int argc, char **argv)
      * So the floor comes off the top. A layer needs topk experts at once, and
      * a little more than that is what makes the cache more than a staging
      * buffer -- but the hard minimum is what is enforced here. */
-    const int64_t efloor = (int64_t)c.topk * dsv4_cache_expert_bytes(&c);
+    const int64_t efloor = (int64_t)c.topk * dsv4_cache_slot_bytes(&c);
     if (budget <= efloor) {
         fprintf(stderr, "--budget %.1f GB cannot work: one layer's %d experts "
                         "alone need %.2f GB,\n  and the trunk needs room too.\n",

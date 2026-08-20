@@ -38,6 +38,7 @@ static int expert_geometry(DSV4Cache *c, const DSV4Cfg *cfg)
     for (int i = 0; i < 3; i++) { c->off_s[i] = off; c->len_s[i] = sb[i]; off += sb[i]; }
     for (int i = 0; i < 3; i++) { c->off_w[i] = off; c->len_w[i] = wb[i]; off += wb[i]; }
     c->expert_bytes = off;
+    c->slot_bytes   = off + DSV4_SLOT_SLACK;
     return 0;
 }
 
@@ -56,8 +57,8 @@ static void bind_slot(DSV4Cache *c, DSV4Slot *s)
         m[i]->cols  = (int)cols[i];
         m[i]->blk_r = 1;
         m[i]->blk_c = 32;
-        m[i]->w = s->bytes + c->off_w[i];
-        m[i]->s = s->bytes + c->off_s[i];
+        m[i]->w = s->bytes + s->toff[3 + i];
+        m[i]->s = s->bytes + s->toff[i];
     }
 }
 
@@ -67,6 +68,14 @@ int64_t dsv4_cache_expert_bytes(const DSV4Cfg *cfg)
     memset(&tmp, 0, sizeof tmp);
     expert_geometry(&tmp, cfg);
     return tmp.expert_bytes;
+}
+
+int64_t dsv4_cache_slot_bytes(const DSV4Cfg *cfg)
+{
+    DSV4Cache tmp;
+    memset(&tmp, 0, sizeof tmp);
+    expert_geometry(&tmp, cfg);
+    return tmp.slot_bytes;
 }
 
 int dsv4_cache_init(DSV4Cache *c, const DSV4St *st, const DSV4Cfg *cfg,
@@ -128,7 +137,9 @@ int dsv4_cache_init(DSV4Cache *c, const DSV4St *st, const DSV4Cfg *cfg,
                         "through the page cache, which at a 148 GB working set "
                         "evicts more than it saves\n");
 
-    c->nslot = (int)(budget_bytes / c->expert_bytes);
+    /* Charged against slot_bytes, not expert_bytes: the alignment slack is
+     * real memory and the budget is a promise about peak RSS. */
+    c->nslot = (int)(budget_bytes / c->slot_bytes);
 
     /* SAY SO WHEN THE CACHE CANNOT POSSIBLY WORK.
      *
@@ -161,8 +172,18 @@ int dsv4_cache_init(DSV4Cache *c, const DSV4St *st, const DSV4Cfg *cfg,
 
     for (int i = 0; i < c->nslot; i++) {
         c->slot[i].layer = -1;
-        c->slot[i].bytes = (unsigned char *)malloc((size_t)c->expert_bytes);
-        if (!c->slot[i].bytes) { dsv4_cache_free(c); return -1; }
+        /* 4096-aligned so a widened O_DIRECT window can be read straight in. */
+        if (posix_memalign((void **)&c->slot[i].bytes, 4096,
+                           (size_t)c->slot_bytes) != 0) {
+            c->slot[i].bytes = NULL;
+            dsv4_cache_free(c); return -1;
+        }
+        /* Until the first load, the compact layout is the honest description
+         * of an empty slot -- bind_slot needs SOMETHING coherent to point at. */
+        for (int k = 0; k < 3; k++) {
+            c->slot[i].toff[k]     = c->off_s[k];
+            c->slot[i].toff[3 + k] = c->off_w[k];
+        }
         bind_slot(c, &c->slot[i]);
     }
     return 0;
@@ -245,13 +266,17 @@ static int resolve_expert(DSV4Cache *c, int layer, int expert,
 static int load_expert(DSV4Cache *c, DSV4Slot *s, const DSV4Tensor *t[6],
                        unsigned char *bounce, uint64_t *bytes_read)
 {
-    /* (file offset, slot offset, length, shard), in slot order: s,s,s,w,w,w */
-    struct { int64_t foff, soff, len; int shard; } r[6];
+    /* (file offset, length, shard, which tensor), in slot order: s,s,s,w,w,w.
+     * `idx` survives the sort because the slot offset is no longer a constant
+     * derived from position -- it is assigned during placement below. */
+    struct { int64_t foff, len; int shard, idx; } r[6];
     for (int i = 0; i < 3; i++) {
-        r[i].foff  = t[i * 2 + 1]->off;  r[i].soff = c->off_s[i];
+        r[i].foff  = t[i * 2 + 1]->off;
         r[i].len   = t[i * 2 + 1]->nbytes; r[i].shard = t[i * 2 + 1]->shard;
-        r[3 + i].foff  = t[i * 2]->off;   r[3 + i].soff = c->off_w[i];
+        r[i].idx   = i;
+        r[3 + i].foff  = t[i * 2]->off;
         r[3 + i].len   = t[i * 2]->nbytes; r[3 + i].shard = t[i * 2]->shard;
+        r[3 + i].idx   = 3 + i;
     }
     /* six elements: insertion sort is the right tool */
     for (int i = 1; i < 6; i++)
@@ -259,45 +284,99 @@ static int load_expert(DSV4Cache *c, DSV4Slot *s, const DSV4Tensor *t[6],
             const typeof(r[0]) tmp = r[j]; r[j] = r[j - 1]; r[j - 1] = tmp;
         }
 
+    int64_t cursor = 0;
     int i = 0;
     while (i < 6) {
         int j = i;
-        /* extend while both the FILE and the SLOT stay contiguous */
+        /* Extend while the FILE stays contiguous. The slot no longer has to
+         * agree: the run is placed as a unit, so its members stay adjacent by
+         * construction. */
         while (j + 1 < 6
                && r[j + 1].shard == r[i].shard
-               && r[j + 1].foff  == r[j].foff + r[j].len
-               && r[j + 1].soff  == r[j].soff + r[j].len)
+               && r[j + 1].foff  == r[j].foff + r[j].len)
             j++;
 
         int64_t len = 0;
         for (int k = i; k <= j; k++) len += r[k].len;
+
+        /* PLACE THE RUN SO O_DIRECT CAN LAND IT WITHOUT A COPY.
+         *
+         * dsv4_st_read_aligned widens to the enclosing 4096 window and reports
+         * the payload as sitting `pad` bytes into whatever buffer it was given.
+         * That buffer must itself be 4096-aligned. So choose the run's slot
+         * offset `soff` to have the SAME residue as its file offset: then
+         * (bytes + soff - pad) is 4096-aligned, the window is read straight
+         * into the slot, and the payload is already in place.
+         *
+         * Every expert tensor in the released checkpoint is unaligned -- the
+         * data section starts at a fixed odd offset -- so this is the normal
+         * path, not a special case. */
+        const int64_t pad  = r[i].foff & (int64_t)4095;
+        /* The window starts `pad` bytes BEFORE the payload, so the payload must
+         * sit at least `pad` past the previous run -- otherwise this read reaches
+         * back and clobbers the tail of the run already loaded. Reserving only
+         * soff >= cursor is not enough, and the damage is silent: the bytes are
+         * wrong, the logits drift, routing collapses onto a handful of experts
+         * and the cache hit rate goes UP. It cost a 95% hit rate that looked
+         * like a win. */
+        const int64_t base = cursor + pad;
+        const int64_t soff = base + ((pad - base) & (int64_t)4095);
+        const int64_t wlen = (pad + len + 4095) & ~(int64_t)4095;
+        const int use_slot = (soff - pad + wlen) <= c->slot_bytes;
+        int64_t place;
 
         /* O_DIRECT through the staging buffer. The page cache is not merely
          * unhelpful for these reads, it is harmful: a 148 GB expert working set
          * cannot be cached in 23 GB, so every buffered read evicts pages that
          * WOULD have been reused to hold 12 MB that will not be. Measured cold:
          * 1.00 GB/s buffered against 4.4 GB/s raw O_DIRECT on this disk. */
-        if (c->direct && len <= c->bounce_cap - 2 * 4096) {
+        if (c->direct && use_slot) {
+            /* The fast path: no copy at all. */
+            int64_t poff = 0;
+            const int64_t n = dsv4_st_read_aligned(
+                c->st, r[i].shard, r[i].foff, len,
+                s->bytes + soff - pad, c->slot_bytes - (soff - pad), &poff);
+            if (n != len || poff != pad) return -1;
+            place = soff;
+        } else if (c->direct && len <= c->bounce_cap - 2 * 4096) {
+            /* fall back to the compact position; no alignment needed here */
+            /* Fallback, kept so a checkpoint that scattered these tensors into
+             * more runs than the slack allows still loads correctly. */
             int64_t poff = 0;
             const int64_t n = dsv4_st_read_aligned(c->st, r[i].shard, r[i].foff,
                                                    len, bounce, c->bounce_cap,
                                                    &poff);
             if (n != len) return -1;
-            memcpy(s->bytes + r[i].soff, bounce + poff, (size_t)len);
+            if (cursor + len > c->slot_bytes) return -1;
+            memcpy(s->bytes + cursor, bounce + poff, (size_t)len);
+            place = cursor;
         } else {
+            if (cursor + len > c->slot_bytes) return -1;
+            place = cursor;
             int64_t got = 0;
             while (got < len) {
                 const ssize_t n = pread(c->st->fd[r[i].shard],
-                                        s->bytes + r[i].soff + got,
+                                        s->bytes + place + got,
                                         (size_t)(len - got),
                                         (off_t)(r[i].foff + got));
                 if (n <= 0) return -1;
                 got += n;
             }
         }
+
+        /* Record where each tensor of this run actually landed. */
+        int64_t at = place;
+        for (int k = i; k <= j; k++) { s->toff[r[k].idx] = at; at += r[k].len; }
+        cursor = place + len;
+
         *bytes_read += (uint64_t)len;
         i = j + 1;
     }
+
+    /* The layout is per-load now, so the matrix pointers are rebound here
+     * rather than once at construction. Touches only this slot, which is what
+     * makes it safe inside dsv4_cache_get_many's parallel read pass. */
+    bind_slot(c, s);
     return 0;
 }
 

@@ -2,6 +2,8 @@
 /* test_cache.c - the routed-expert LRU, against the synthetic fixture. */
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>          /* pread, for the independent reference read */
+
 #include "dsv4_cache.h"
 #include "dsv4_cfg.h"
 
@@ -50,8 +52,10 @@ int main(void)
     printf("\n-- GATE 3  hit, miss and LRU eviction order --\n");
     {
         DSV4Cache k;
-        /* Two slots exactly, so eviction is forced and predictable. */
-        dsv4_cache_init(&k, &st, &c, 13369344LL * 2);
+        /* Two slots exactly, so eviction is forced and predictable. Ask in
+         * units of what a slot COSTS, not what an expert weighs -- a slot also
+         * carries the alignment slack that keeps O_DIRECT copy-free. */
+        dsv4_cache_init(&k, &st, &c, dsv4_cache_slot_bytes(&c) * 2);
         CHECK(k.nslot == 2, "%d slots, expected 2", k.nslot);
 
         /* The fixture only carries expert 0 of layers 2 and 3, so use those. */
@@ -130,7 +134,58 @@ int main(void)
         dsv4_cache_free(&k);
     }
 
-    printf("\n-- GATE 6  the concurrent fetch equals the serial one, byte for byte --\n");
+    printf("\n-- GATE 6  cached bytes equal an INDEPENDENT read of the same tensors --\n");
+    {
+        /* Every other check here compares the cache against itself, which is
+         * exactly how a placement bug survived: O_DIRECT reads are widened to
+         * the enclosing 4096 window, and a window that reached back over the
+         * previous run corrupted it identically on every path -- so serial and
+         * concurrent agreed, on the wrong bytes. The only cure is a reference
+         * sharing no code with the fast path: a plain buffered pread of the
+         * same tensor, compared byte for byte. */
+        DSV4Cache k;
+        dsv4_cache_init(&k, &st, &c, 1LL << 30);
+        int bad = 0, checked = 0;
+        for (int e = 0; e < 4 && !bad; e++) {
+            const DSV4ExpertW *w = dsv4_cache_get(&k, 2, e);
+            if (!w) continue;
+            const DSV4QMat *m[6] = { &w->w1, &w->w2, &w->w3,
+                                     &w->w1, &w->w2, &w->w3 };
+            const char *sfx[6] = { "w1.weight", "w2.weight", "w3.weight",
+                                   "w1.scale",  "w2.scale",  "w3.scale" };
+            for (int t = 0; t < 6 && !bad; t++) {
+                char name[256];
+                snprintf(name, sizeof name, "layers.2.ffn.experts.%d.%s", e, sfx[t]);
+                const DSV4Tensor *ti = dsv4_st_find(&st, name);
+                if (!ti) continue;
+                unsigned char *ref = (unsigned char *)malloc((size_t)ti->nbytes);
+                if (!ref) { bad = 1; break; }
+                int64_t got = 0;
+                while (got < ti->nbytes) {
+                    const ssize_t n = pread(st.fd[ti->shard], ref + got,
+                                            (size_t)(ti->nbytes - got),
+                                            (off_t)(ti->off + got));
+                    if (n <= 0) break;
+                    got += n;
+                }
+                const unsigned char *have = (t < 3) ? m[t]->w : m[t]->s;
+                if (got != ti->nbytes
+                    || memcmp(ref, have, (size_t)ti->nbytes) != 0) {
+                    CHECK(0, "expert %d %s differs from a buffered read of the "
+                             "same bytes", e, sfx[t]);
+                    bad = 1;
+                }
+                checked++;
+                free(ref);
+            }
+        }
+        if (!bad)
+            printf("  ok    %d tensors byte-identical to an independent "
+                   "buffered read\n", checked);
+        dsv4_cache_free(&k);
+    }
+
+    printf("\n-- GATE 7  the concurrent fetch equals the serial one, byte for byte --\n");
     {
         /* dsv4_cache_get_many reads its misses on several threads at once. The
          * bytes it produces must be indistinguishable from six calls to

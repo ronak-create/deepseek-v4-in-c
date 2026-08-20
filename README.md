@@ -121,7 +121,11 @@ correctness. Measured on Flash, same prompt:
 | 16 GB | 18.08 GB | 2.14 – 2.21 | 43 / 43 |
 | 16 GB + `--gpu` | 18.19 GB | **1.62 – 1.74** | 43 / 43 |
 
-Ranges are two runs of the same command; single figures are one run. These are
+Ranges are two runs of the same command; single figures are one run. These were
+measured before [the expert cache stopped copying](#the-expert-cache-reads-straight-into-its-slots),
+which is worth about 12% and is not yet reflected here — the machine has to go
+cold again first, and mixing a warm number into a cold table is exactly the
+mistake this page already made once. These are
 short runs, so the fixed cost of filling a cold cache is spread over 26 tokens
 — treat the small-budget rows as an upper bound on what a small machine pays.
 
@@ -229,6 +233,58 @@ The microbenchmark keeps the device saturated back to back; the model only
 touches it a few times per layer, so the pathology is real but rarely at full
 strength. The reservation is still the right default — it never loses — but it
 is a modest win, not a 3x one.
+
+## The expert cache reads straight into its slots
+
+`O_DIRECT` needs the file offset, the length and the destination buffer all
+4096-aligned. Every expert tensor in the released checkpoint is unaligned — the
+data section starts at a fixed odd offset — so reads used to be widened to the
+enclosing window, landed in a staging buffer, and were then **memcpy'd** into
+the cache slot. A 12.75 MB copy, 4,887 times a run.
+
+The old comment here justified that as "~1 ms against the ~10 ms the unbuffered
+read saves". The read is not 10 ms. Measured on this disk: a 12.75 MB O_DIRECT
+read takes **2.81 ms**, while the engine was spending **3.60 ms** per expert.
+The copy was not a rounding error, it was 22% of the cost.
+
+Slots are now allocated 4096-aligned with a little slack, and each coalesced run
+is placed at the offset whose alignment residue matches its file offset. The
+widened window is then read *straight into the slot* and the payload is already
+where it belongs. No copy at all.
+
+Measured as an A/B, the two builds interleaved so disk and thermal drift hit
+both equally, two runs each:
+
+| | s/token | routed-expert disk | GB read | peak RSS |
+|---|---|---|---|---|
+| staging buffer + memcpy | 1.84, 1.82 | 17.6 s, 17.3 s | 60.85 | 18.19 GB |
+| straight into the slot | **1.67, 1.55** | **15.2 s, 14.1 s** | 60.87 | 17.96 GB |
+
+Identical token ids, the same hit rate and the same bytes read — so the
+difference is the copy and nothing else. **Disk time −16%, wall clock −12%**,
+and peak RSS is slightly *lower* because the slack costs one slot.
+
+### It was wrong first, and the gates said it was fine
+
+The first version of this placed each run at the next offset with a matching
+residue, which is not sufficient: a window begins up to 4095 bytes *before* its
+payload, so the second run's read reached back over the first run's bytes and
+corrupted them. The damage was silent and it looked like a triumph — routing
+collapsed onto a handful of experts, so the cache hit rate went from 52.6% to
+**95.5%**, disk reads from 60.85 GB to 5.76 GB, and the model appeared to run at
+1.06 s/token. Only the token ids gave it away.
+
+Every cache gate passed throughout, for two compounding reasons, both now fixed:
+
+- The gates compared the cache **against itself** — serial against concurrent —
+  and both paths corrupted the bytes identically. There is now a gate that
+  compares against a plain buffered `pread` of the same tensors, which shares no
+  code with the fast path.
+- The synthetic fixture stored an expert's six tensors **contiguously**, so an
+  expert loaded as one run and the second-run case never arose. The real
+  checkpoint splits them: three scales in one run, three weights ~341 MB away at
+  a different residue. The fixture now mirrors that, and the new gate fails
+  without the fix.
 
 ## Prefill is the expensive half, and it is not batched
 
