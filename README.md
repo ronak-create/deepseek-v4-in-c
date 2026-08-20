@@ -222,6 +222,93 @@ That gate is not ceremony. Until recently the binder validated `wo_a` as
 they are 4096 against a hidden of 7168, and it would have failed on layer 0. A
 Flash-only test suite could not have caught it.
 
+## Measured on
+
+Every number in this README came from one machine, stated so the numbers can be
+argued with:
+
+| | |
+|---|---|
+| CPU | 20-core x86-64, AVX2 + FMA, no AVX-512 |
+| GPU | RTX 5060 Laptop, 8 GB, sm_120 (Blackwell), CUDA 13.3 |
+| Disk | PCIe Gen4 NVMe, 4.4 GB/s sequential O_DIRECT |
+| OS | WSL2 / Ubuntu 24.04, 23 GB available to the VM |
+
+Two caveats worth applying to every figure. Run-to-run variance on the full
+model is about **20%**, dominated by disk and thermal state — which is why
+kernel changes are measured with `bench/matmul_bw.c` rather than by timing a
+generation. And this is a laptop: the numbers here were taken on AC power in
+performance mode, after hours of sustained load, so they are if anything
+pessimistic.
+
+## Kernel throughput
+
+`bench/matmul_bw.c`, best of 15, at Flash's real matrix shapes. "bitwise equal"
+is the scalar path against the AVX2 path — not a tolerance:
+
+| kernel | scalar | AVX2 | speedup | bitwise equal |
+|---|---|---|---|---|
+| fp4 expert w1 2048x4096 | 36.3 GF/s | **103.5 GF/s** | 2.85x | yes |
+| fp4 expert w2 4096x2048 | 41.5 GF/s | **114.3 GF/s** | 2.76x | yes |
+| fp8 attn wo_b 4096x8192 | 14.3 GF/s | 18.1 GF/s | 1.27x | yes |
+| fp8 attn wq_b 32768x1024 | 13.7 GF/s | 19.4 GF/s | 1.41x | yes |
+
+FP8 barely moving is the informative part: those matrices are 33.5 MB and are
+re-read from RAM every layer, so they are bandwidth-bound rather than
+conversion-bound. That is the measurement that argues for putting the trunk in
+VRAM instead of optimising it further on the CPU.
+
+Per-call, including the PCIe round trip:
+
+| | GPU | CPU (AVX2) |
+|---|---|---|
+| fp8 wo_b 4096x8192 | **1.50 ms** | 3.89 ms |
+| fp8 wq_b 32768x1024 | **1.34 ms** | 3.40 ms |
+
+There is a ~1.3 ms floor per call that barely varies with size, so the GPU wins
+on the 33.5 MB matrices and loses on small ones — `wkv` is 4.2 MFLOP, which the
+CPU finishes in 0.23 ms.
+
+## The GPU needs a spare core
+
+`bench/gpu_contention.c` times the same CPU-only FP4 matmul with the device idle
+and busy:
+
+| | CPU throughput |
+|---|---|
+| device idle | 114.2 GF/s |
+| device busy, 20 OpenMP threads | **5.0 GF/s** — 21.7x collapse |
+| device busy, one core reserved | 113.8 GF/s — no contention |
+
+CUDA's default synchronisation spins, and a spinning thread on a pool that
+already has one worker per core competes with the threads it waits behind. On
+the real model that was 142 s versus 47 s. `--gpu` reserves a core
+automatically; an explicit `OMP_NUM_THREADS` is honoured instead.
+
+## Expert routing
+
+From a real code-completion run (`--route-log` + `tools/sim_cache.py`), 136
+forward passes:
+
+| | |
+|---|---|
+| expert requests | 35,088, all served |
+| distinct experts used | 5,861 of 11,008 (43 layers x 256) |
+| hottest expert | fired in 118 of 136 passes |
+| used exactly once | 27% — can never be a cache hit |
+| reuse ceiling (infinite cache) | **83.3%** |
+
+| cache | LRU | frequency-pinned | Belady (bound) |
+|---|---|---|---|
+| 9.6 GB | 45.9% | 49.1% | 67.5% |
+| 16 GB | 57.1% | 60.3% | 75.4% |
+| 24 GB | 67.7% | 68.6% | 79.7% |
+
+Frequency-pinning beats LRU by ~3 points and loses at small sizes, which is why
+the policy stays LRU. Code routes more repetitively than prose — the same
+measurement on an English prompt gives a 69.9% ceiling against 83.3% here — so
+the cache pays off better on coding work.
+
 ## Benchmarks and diagnostics
 
 ```sh

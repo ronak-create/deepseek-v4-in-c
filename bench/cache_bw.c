@@ -13,7 +13,8 @@
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);
                         return t.tv_sec+1e-9*t.tv_nsec;}
 int main(int argc,char**argv){
-  const char *m = argc>1?argv[1]:"/home/ronak/models/dsv4-flash";
+  const char *m = argc>1?argv[1]:getenv("DSV4_MODEL");
+  if(!m){printf("usage: cache_bw <model_dir> [reps] [experts]\n");return 2;}
   int reps = argc>2?atoi(argv[2]):3, per = argc>3?atoi(argv[3]):60;
   DSV4Cfg c; int cr[DSV4_MAX_LAYERS]; DSV4St st;
   if(!dsv4_cfg_load_file(&c,cr,DSV4_MAX_LAYERS,
