@@ -157,8 +157,27 @@ int main(int argc, char **argv)
      * requests, ZERO hits.
      *
      * So: let the trunk take what it can use, and give the cache the rest. */
+    /* RESERVE THE CACHE'S FLOOR BEFORE THE TRUNK TAKES ITS SHARE.
+     *
+     * The trunk is given what it can use and the cache gets the remainder --
+     * right for Flash, whose 6.27 GB trunk pins completely and leaves plenty.
+     * It inverts badly the moment the trunk is larger than RAM. Pro's is ~50
+     * GB: handed the whole budget it would pin layers until the money ran out
+     * and leave the cache with nothing, and since a layer's top-k experts must
+     * be resident together, the engine would refuse to start at all.
+     *
+     * So the floor comes off the top. A layer needs topk experts at once, and
+     * a little more than that is what makes the cache more than a staging
+     * buffer -- but the hard minimum is what is enforced here. */
+    const int64_t efloor = (int64_t)c.topk * dsv4_cache_expert_bytes(&c);
+    if (budget <= efloor) {
+        fprintf(stderr, "--budget %.1f GB cannot work: one layer's %d experts "
+                        "alone need %.2f GB,\n  and the trunk needs room too.\n",
+                budget_gb, c.topk, (double)efloor / 1073741824.0);
+        return 1;
+    }
     DSV4Trunk tr;
-    if (dsv4_trunk_open(&tr, trunkdir, &c, budget) != 0) return 1;
+    if (dsv4_trunk_open(&tr, trunkdir, &c, budget - efloor) != 0) return 1;
     int64_t left = budget - dsv4_trunk_resident_bytes(&tr);
     DSV4Cache cache;
     if (dsv4_cache_init(&cache, &st, &c, left) != 0) return 1;

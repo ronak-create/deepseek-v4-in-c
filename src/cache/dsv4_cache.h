@@ -88,6 +88,13 @@ typedef struct {
 /* budget_bytes decides the slot count. Returns 0 on success.
  * A budget below one expert is an error: a cache that cannot hold a single
  * entry would miss on every access and read the same bytes six times a layer. */
+/* Bytes one routed expert occupies, from config alone. Exposed because the
+ * budget planner has to reserve room for topk of them BEFORE handing the trunk
+ * its share -- otherwise a model whose trunk is larger than RAM (Pro's is ~50
+ * GB) lets the trunk swallow the whole budget and the cache is left below the
+ * minimum it needs to serve a single layer. */
+int64_t dsv4_cache_expert_bytes(const DSV4Cfg *cfg);
+
 int  dsv4_cache_init(DSV4Cache *c, const DSV4St *st, const DSV4Cfg *cfg,
                      int64_t budget_bytes);
 void dsv4_cache_free(DSV4Cache *c);

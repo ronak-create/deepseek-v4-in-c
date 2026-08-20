@@ -61,12 +61,43 @@ static void bind_slot(DSV4Cache *c, DSV4Slot *s)
     }
 }
 
+int64_t dsv4_cache_expert_bytes(const DSV4Cfg *cfg)
+{
+    DSV4Cache tmp;
+    memset(&tmp, 0, sizeof tmp);
+    expert_geometry(&tmp, cfg);
+    return tmp.expert_bytes;
+}
+
 int dsv4_cache_init(DSV4Cache *c, const DSV4St *st, const DSV4Cfg *cfg,
                     int64_t budget_bytes)
 {
     memset(c, 0, sizeof *c);
     c->st = st; c->cfg = cfg;
     expert_geometry(c, cfg);
+
+    /* A cache smaller than topk cannot serve a whole layer, and it is worth
+     * saying so -- but it is a WARNING here, not an error.
+     *
+     * The constraint belongs to dsv4_cache_get_many, which fetches a layer's
+     * top-k together and will not evict a slot it has already claimed for the
+     * same call. A caller using dsv4_cache_get one expert at a time is fine
+     * with two slots, and the cache gate depends on exactly that to test
+     * eviction order. Enforcing it here broke that gate and told me the check
+     * was in the wrong place.
+     *
+     * Prevention lives in the budget planner (dsv4_run.c reserves topk experts
+     * before the trunk takes its share) and the last line of defence is in
+     * moe(), which aborts rather than emit a token routed through fewer experts
+     * than the model specifies. That failure used to be silent: at --budget 3
+     * the cache got 5 slots against a top-k of 6 and the fourth generated token
+     * quietly changed. */
+    if ((int64_t)cfg->topk * c->expert_bytes > budget_bytes)
+        fprintf(stderr,
+                "dsv4_cache: %lld slots cannot hold one layer's %d experts at "
+                "once;\n"
+                "  dsv4_cache_get_many will fail. Single-expert use is fine.\n",
+                (long long)(budget_bytes / c->expert_bytes), cfg->topk);
 
     if (budget_bytes < c->expert_bytes) {
         fprintf(stderr, "dsv4_cache: budget %lld bytes cannot hold one expert "

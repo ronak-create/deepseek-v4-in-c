@@ -399,7 +399,23 @@ static void moe(float *out, const float *x, const DSV4LayerW *w,
 
     t0 = pnow();
     for (int k = 0; k < c->topk; k++) {
-        if (!ex[k]) continue;                /* caller-reported; see header */
+        if (!ex[k]) {
+            /* NOT survivable. dsv4_cache.h states it plainly: a NULL means the
+             * expert could not be provided, and skipping it leaves the token
+             * routed through fewer experts than the model specifies -- which is
+             * a different model, producing fluent and wrong output.
+             *
+             * This used to `continue`. Running Flash at --budget 3 left the
+             * cache with 5 slots against a top-k of 6, and the fourth generated
+             * token silently changed. The cache now refuses such a budget up
+             * front; this is the second line of defence, because a wrong answer
+             * that looks right is the worst failure this engine can have. */
+            fprintf(stderr, "dsv4_layer: layer %d could not obtain routed "
+                            "expert %d of %d; refusing to emit a token routed "
+                            "through fewer experts than the model specifies\n",
+                    layer, k + 1, c->topk);
+            abort();
+        }
         expert_forward(s->expert_acc, x, ex[k], s, c->hidden, c->moe_inter,
                        c->swiglu_limit);
         const float wk = s->topk_w[k];
