@@ -140,12 +140,29 @@ const DSV4ExpertW *dsv4_cache_get(DSV4Cache *c, int layer, int expert);
  *   6.2 ms per 12.75 MB miss where an isolated read takes 2.8 ms. The fix is
  *   more requests in flight, and the only place to find them is within a layer.
  *
- *   Cross-LAYER prefetch is not merely unimplemented, it is impossible: layer
- *   L+1's router consumes layer L's output, so L+1's expert ids do not exist
- *   until L has finished. (Layers below num_hash_layers are the exception --
- *   tid2eid makes their experts a pure function of the token id.) Within one
- *   layer, though, the top-k experts are chosen together and are mutually
- *   independent, which is exactly the parallelism this takes.
+ *   Within one layer the top-k experts are chosen together and are mutually
+ *   independent, which is exactly the parallelism this takes. Cross-LAYER is
+ *   three separate questions, and an earlier version of this comment collapsed
+ *   them into one wrong answer ("impossible"):
+ *
+ *     - EXACT, on a scored layer: genuinely impossible. Layer L+1's router
+ *       consumes layer L's output, so L+1's expert ids do not exist until L
+ *       has finished. No amount of engineering gets around a data dependency.
+ *
+ *     - EXACT, on a hash layer (layer < num_hash_layers -- 3 of 43 on both
+ *       released models): possible and unimplemented. tid2eid makes those
+ *       experts a pure function of the token id, so the moment a token is
+ *       sampled, the experts for the NEXT token's layers 0..2 are known
+ *       exactly. ~7% of expert traffic; small, but free of any guess.
+ *
+ *     - SPECULATIVE, on any layer: possible and unimplemented. A predictor
+ *       that guesses L+1 from L costs correctness nothing -- a wrong guess is
+ *       a wasted read, not a wrong token -- provided it prefetches into slots
+ *       that cannot evict a live entry. colibri (JustVugg/colibri) reports
+ *       71.6% one-layer-ahead predictability on its models; whether that holds
+ *       for DeepSeek-V4's routing is unmeasured here, and cheap to settle by
+ *       replaying a --route-log through tools/sim_cache.py before writing any
+ *       of it.
  *
  * DETERMINISM. Slot selection, LRU stamps and eviction all happen in a serial
  * pass in request order, before any I/O starts; only the reads themselves run

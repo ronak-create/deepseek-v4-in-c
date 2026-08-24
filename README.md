@@ -14,6 +14,34 @@ safetensors reader, the trunk streamer, the expert cache, the memory planner.
 The other 60% is new: DeepSeek-V4 shares none of K3's math, so every kernel was
 written from DeepSeek's own reference implementation.
 
+## When this is the wrong tool
+
+The headline — 284B parameters on 3.2 GB of RAM — invites the wrong comparison.
+This is not a faster llama.cpp. It is *slower than llama.cpp at everything
+llama.cpp can already do*. What it does instead is run a checkpoint that does not
+fit at all, at a speed that is poor but finite, without changing a single output
+bit.
+
+| your situation | use |
+|---|---|
+| the model fits in RAM or VRAM | **llama.cpp** — streaming is overhead you would be paying for nothing |
+| the model fits across VRAM + RAM combined | **[KTransformers](https://github.com/kvcache-ai/ktransformers)** — hybrid CPU/GPU, has supported Flash since May 2026 |
+| it does not fit at all, and you want output identical to the reference | **this** |
+| it does not fit at all, and you want it fast | **[colibri](https://github.com/JustVugg/colibri)** — same bet, further along on the I/O path |
+
+A 27B model in 12–16 GB needs none of this. Neither does a quantised 70B on a
+box with 64 GB. The streaming design only earns its keep once the checkpoint is
+several times larger than everything you can address, and the alternative is not
+"slower" but "no".
+
+colibri deserves the pointer: it is also pure C and Apache-2.0, it also runs
+DeepSeek-V4-Flash, and it has already shipped async prefetch with router
+lookahead, batch-union reads and multi-drive striping — three things this
+repo lists as future work. Its published Flash figure is faster than the one
+below, on different hardware. A like-for-like run on one machine has not been
+done yet, so treat that as "unmeasured", not as "we are faster" in either
+direction.
+
 ## Status
 
 | | |
@@ -476,6 +504,45 @@ trace, so unlike every timing on this page they do not move with thermal state �
 they are properties of the routing, not of the machine. Code routes more repetitively than prose — the same
 measurement on an English prompt gives a 69.9% ceiling against 83.3% here — so
 the cache pays off better on coding work.
+
+## Does this wear out your SSD?
+
+Asked twice within a day of publishing, so it belongs here.
+
+**The inference path never writes.** Checkpoint shards are opened `O_RDONLY`
+(`src/io/dsv4_st.c:212`, and `O_RDONLY | O_DIRECT` at `:360`) and read with
+`pread`. There is no `mmap`, no scratch file, no spill, no swap-backed
+temporary. The only file this engine ever creates is the optional
+`--route-log`: one short text line per expert request, about 350 KB for the
+35,088-request trace in [Expert routing](#expert-routing), and off by default.
+
+Endurance ratings — TBW, DWPD — are *write* ratings. This workload contributes
+nothing to them. The 40-pass run in [Where the time goes](#where-the-time-goes)
+reads 60.87 GB and writes zero bytes.
+
+That is not the whole answer, though, and the honest remainder is **read
+disturb**: repeatedly reading the same NAND cells can perturb the charge in
+neighbouring cells, and the controller responds by relocating that block in the
+background — a write the host never issued. The workload here is close to the
+shape that provokes it, since the hot experts are read over and over out of the
+same ~137 GB region.
+
+**This repo has not measured it.** Whether it produces a countable number of
+relocations on any particular drive is a question about that drive's firmware,
+not about this engine, and the figure is not one to guess at. If you want the
+answer for your hardware it is one command on either side of a run:
+
+```sh
+sudo smartctl -A /dev/nvme0n1 > before.txt
+./bin/dsv4 ~/models/dsv4-flash --trunk ~/dsv4-trunk --tok ~/dsv4_tok.bin \
+    --prompt "The capital of France is" --gen 25 --budget 16 --gpu
+sudo smartctl -A /dev/nvme0n1 > after.txt
+diff before.txt after.txt
+```
+
+`Data Units Written` should not move at all. If a drive exposes NAND-write or
+media-wear counters and *those* move, that is read disturb showing itself — a
+number this README would like to carry. Send it.
 
 ## Benchmarks and diagnostics
 
