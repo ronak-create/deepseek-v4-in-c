@@ -151,7 +151,7 @@ it is the cheapest possible test of the async machinery item 6 builds.
 *Verify:* hit rate on layers 0–2 should reach ~100% after the first token; tokens
 must be identical; A/B the wall clock and expect low single digits.
 
-### 8. Find out whether the read path is actually queue-depth-bound
+### 8. Find out whether the read path is actually queue-depth-bound — DONE, NEGATIVE
 **From:** `ProfessionalJackals` — "buy a ton of NVMes and parallel read".
 
 The in-thread answer had the right instinct: the limit is probably requests in
@@ -167,6 +167,27 @@ depth 1 → 32 on this drive.
   Record that as a negative result and stop.
 
 *Verify:* the QD sweep is the deliverable. Only then decide.
+
+**Done 2026-08-25.** `cache_bw <model> qd` sweeps depth 1–32 with expert-sized
+O_DIRECT reads over distinct regions of the real checkpoint. Three consecutive
+runs agree to within 2%:
+
+| QD | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 | 24 | 32 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| GB/s | 3.95 | **4.98** | 4.56 | 4.66 | 4.97 | 4.81 | 4.94 | 4.70 | 4.61 | 4.77 |
+
+It plateaus at QD2. Concurrency is worth ~25% and the existing six-wide
+`get_many` already collects all of it. **So the second branch above is the one
+that holds: io_uring buys nothing, and striping is the only lever.** Recorded as
+a negative result; neither is being built.
+
+The sweep also retired the number that motivated the question. `dsv4_cache.h`
+claimed 2.0 GB/s in situ against 4.4 benchmarked. Since the cache started
+reading straight into its slot (`f185fee`), a live run moves 32.16 GB of experts
+in 7.8–10.5 s = 3.1–4.1 GB/s, i.e. 75–95% of the drive's ceiling at any depth.
+There is no large in-situ gap left. That also weakens item 6's expected payoff:
+overlap can only hide I/O behind compute, and the I/O is no longer the
+underperforming half.
 
 ### 9. Prefill batching — still the biggest single win
 **From:** the r/OpenSourceAI post's own contribution ask; unchanged by comments.

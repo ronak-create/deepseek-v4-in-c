@@ -612,11 +612,13 @@ number this README would like to carry. Send it.
 ## Benchmarks and diagnostics
 
 ```sh
-make bench                 # builds all three
+make bench                 # builds all four
 ./bin/matmul_bw 15         # scalar vs AVX2 vs GPU, at real geometries
 ./bin/gpu_contention spin  # CPU throughput while the device is busy
 ./bin/gpu_contention block # the same with blocking sync, for comparison
-./bin/cache_bw             # expert read throughput, cold
+./bin/gpu_call 200         # per-call GPU cost against matrix size
+./bin/cache_bw  <model>    # expert read throughput, cold
+./bin/cache_bw  <model> qd # the same against queue depth 1..32
 python3 tools/sim_cache.py route.log   # replay a routing trace vs LRU/LFU/Belady
 ```
 
@@ -627,6 +629,36 @@ sequential reads. One forward pass needs 258 of them.
 `matmul_bw` exists because the model run is a poor instrument: it takes ~70 s
 and moves ±20% with disk and thermal state, which cannot resolve a 12% kernel
 change.
+
+### Is the read path queue-depth-bound? No, and that closes a whole roadmap item
+
+A launch-thread suggestion — buy more NVMes and read in parallel — came with a
+plausible story: the engine issues at most six concurrent expert reads, so it
+must be starved for requests in flight, so `io_uring` and striping should both
+pay. `cache_bw <model> qd` tests that before anyone builds either. It issues
+expert-sized O_DIRECT reads over distinct regions of the real checkpoint at
+concurrency 1 to 32. Three consecutive runs, agreeing to within 2%:
+
+| QD | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 | 24 | 32 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| GB/s | 3.95 | **4.98** | 4.56 | 4.66 | 4.97 | 4.81 | 4.94 | 4.70 | 4.61 | 4.77 |
+
+**Concurrency is worth about 25%, all of it arrives by QD2, and the curve is
+flat from there to 32.** So:
+
+- `io_uring` buys nothing on this drive. Six OpenMP `pread`s already sit well
+  past the knee. The 3–5 days it would have cost are the point of the sweep.
+- More *drives* is the only remaining lever on read bandwidth — a hardware
+  answer, not a software one.
+- `dsv4_cache_get_many` keeps its parallel read, because 25% of the largest
+  component in the profile is worth having. Only the reasoning changes.
+
+It also retires a number this page used to carry. `dsv4_cache.h` said expert
+reads ran at 2.0 GB/s in situ against 4.4 benchmarked, and implied depth would
+close the gap. Since [the cache started reading straight into its slot](#the-expert-cache-reads-straight-into-its-slots),
+a live run moves 32.16 GB of experts in 7.8–10.5 s — **3.1–4.1 GB/s, or 75–95%
+of what the sweep says this drive can do at any depth.** There is no large
+in-situ gap left to explain.
 
 ## Things that were tried and did NOT work
 

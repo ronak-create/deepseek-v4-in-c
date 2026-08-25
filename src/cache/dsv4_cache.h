@@ -135,10 +135,31 @@ const DSV4ExpertW *dsv4_cache_get(DSV4Cache *c, int layer, int expert);
 /* Fetch n experts of one layer AT ONCE, reading the misses concurrently.
  *
  * WHY THIS EXISTS, AND WHY IT IS PER LAYER
- *   Serialised one at a time, expert reads run at queue depth one: measured in
- *   situ at 2.0 GB/s against 4.4 GB/s for the same drive under a benchmark, and
- *   6.2 ms per 12.75 MB miss where an isolated read takes 2.8 ms. The fix is
- *   more requests in flight, and the only place to find them is within a layer.
+ *   Serialised one at a time, expert reads run at queue depth one, and one
+ *   request in flight does not saturate the drive. `cache_bw <model> qd` sweeps
+ *   depth 1..32 with expert-sized O_DIRECT reads over distinct regions of the
+ *   real checkpoint. Three consecutive runs agree to within 2%:
+ *
+ *     QD    1     2     3     4     6     8    12    16    24    32
+ *   GB/s  3.95  4.98  4.56  4.66  4.97  4.81  4.94  4.70  4.61  4.77
+ *
+ *   Concurrency is worth about 25%, ALL of it arrives by QD2, and the curve is
+ *   flat from there to 32. This function is still the right shape -- 25% of the
+ *   largest single component in the profile is worth having, and a layer's
+ *   top-k is the only place independent reads exist -- but read the result
+ *   correctly:
+ *
+ *     - An io_uring submission ring buys NOTHING here. Six OpenMP preads
+ *       already sit past the knee. Worth measuring before building it.
+ *     - More DRIVES is the only remaining lever on read bandwidth, and that is
+ *       a hardware answer, not a software one.
+ *
+ *   An older version of this comment gave the in-situ rate as 2.0 GB/s against
+ *   4.4 benchmarked, and implied depth would close the gap. Both halves are now
+ *   obsolete: with the cache reading straight into its slot, a live run moves
+ *   32.16 GB of experts in 7.8-10.5 s = 3.1-4.1 GB/s, which is 75-95% of what
+ *   the sweep says this drive does at ANY depth. There is no large in-situ gap
+ *   left to explain.
  *
  *   Within one layer the top-k experts are chosen together and are mutually
  *   independent, which is exactly the parallelism this takes. Cross-LAYER is
