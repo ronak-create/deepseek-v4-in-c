@@ -12,8 +12,20 @@ typedef struct {
     float *x1, *resid, *post, *comb, *mixes;
     float *qr, *q, *kv, *o, *ogrp;
     float *gate_scores, *gate_orig, *expert_gate, *expert_up, *expert_out;
-    float *expert_acc;   /* one expert's hidden-width output; MUST NOT
-                          * alias the MoE input -- see dsv4_layer.c */
+    /* ONE ACCUMULATOR PER k, not one shared.
+     *
+     * With overlapped fetching, expert k's matmul runs as soon as expert k is
+     * available -- which is not k order, because the residents go first and the
+     * streamed ones land when the drive says so. The weighted sum into `out`
+     * must still happen in k order or the result stops being bit-identical, so
+     * each k needs somewhere of its own to leave its output until then.
+     *
+     * expert_acc[k] must also never alias the MoE input: x1 IS the MoE input at
+     * every call site, and writing an expert's output there corrupted the input
+     * for every later expert AND the shared expert. Per-kernel gates could not
+     * see it; the whole-block oracle caught it. */
+    float *expert_acc;   /* topk buffers of `hidden`, contiguous */
+    int    expert_acc_stride;
     float *comp_kv_in, *comp_sc_in;   /* compressor projections, one token */
     float *idx_q, *idx_w, *idx_scores; /* CSA indexer working set          */
     int    idx_cap;                    /* how many scores idx_scores holds  */
@@ -41,6 +53,23 @@ typedef struct {
      * output. */
     int (*get_many)(void *ctx, int layer, const int *experts, int n,
                     const DSV4ExpertW **out);
+
+    /* Optional overlapped pair, and the reason moe() is shaped the way it is.
+     *
+     * begin() does the whole decide pass and returns immediately, filling
+     * out[k] for every expert already resident and leaving NULL for every one
+     * that has to be read. end() waits for those reads and fills in the rest.
+     * Between the two, the caller owns the CPU -- so the resident experts'
+     * matmuls run while the streamed ones are still on the wire.
+     *
+     * Both or neither. When either is NULL the layer uses get_many, which is
+     * correct and does not overlap. Output is identical either way, which is
+     * the property the whole design is arranged around: an expert's matmul may
+     * run in any order, but the weighted sum runs in k order regardless. */
+    int (*begin)(void *ctx, int layer, const int *experts, int n,
+                 const DSV4ExpertW **out);
+    int (*end)(void *ctx, const DSV4ExpertW **out);
+
     void *ctx;
 } DSV4ExpertSrc;
 

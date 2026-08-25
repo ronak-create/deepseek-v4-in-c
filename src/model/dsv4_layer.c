@@ -140,7 +140,7 @@ int dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c, int max_pos)
         + (size_t)c->n_experts * 2                  /* gate scores + orig  */
         + inter * 3                                 /* expert gate/up/out  */
         + (size_t)c->n_heads * nidx                 /* attn scratch, PER HEAD */
-        + d                                         /* expert_acc          */
+        + (size_t)c->topk * d                       /* expert_acc, one per k */
         + 4u * (size_t)c->head_dim                  /* comp kv/score in    */
         + (size_t)c->index_n_heads * (size_t)c->index_head_dim  /* idx q  */
         + (size_t)c->index_n_heads                  /* idx head weights    */
@@ -172,7 +172,8 @@ int dsv4_scratch_init(DSV4Scratch *s, const DSV4Cfg *c, int max_pos)
     s->expert_up = p;    p += inter;
     s->expert_out = p;   p += inter;
     s->attn_scratch = p; p += nidx;
-    s->expert_acc = p;   p += d;
+    s->expert_acc = p;   p += (size_t)c->topk * d;
+    s->expert_acc_stride = c->hidden;
     s->comp_kv_in = p;   p += 2u * (size_t)c->head_dim;
     s->comp_sc_in = p;   p += 2u * (size_t)c->head_dim;
     s->idx_q = p;        p += (size_t)c->index_n_heads * (size_t)c->index_head_dim;
@@ -377,25 +378,69 @@ static void moe(float *out, const float *x, const DSV4LayerW *w,
 
     for (int i = 0; i < c->hidden; i++) out[i] = 0.0f;
 
-    /* expert_acc, NOT x1. x1 IS the MoE input `x` at every call site, so
-     * writing an expert's output there corrupts the input for every expert
-     * after the first and for the shared expert too.
+    /* OVERLAP THE RESIDENT EXPERTS' MATMULS WITH THE STREAMED ONES' READS.
      *
-     * That was a live bug. Per-kernel gates could not see it: every matmul and
-     * every activation was correct, and the caller handed one of them a buffer
-     * that aliased its own input. The whole-block oracle caught it. */
-    /* Fetch the whole top-k first, so the misses can be read concurrently.
-     * The accumulation below still runs in k order, so the sum is unchanged to
-     * the bit whichever read finishes first. */
+     * This used to be a hard barrier: fetch all six experts, THEN run all six
+     * matmuls. Disk and expert matmul are two of the three largest movable
+     * components in the profile and they were strictly serialised, while at a
+     * realistic budget about half the top-k is already resident -- so about
+     * half the matmuls could have run during the reads, and did not.
+     *
+     * begin() returns the residents immediately and hands the misses to the
+     * cache's reader pool. Their matmuls run here, on the full OpenMP team,
+     * while the drive works. end() then waits for whatever is left.
+     *
+     * WHAT KEEPS THIS BIT-EXACT
+     *   Each k computes into its OWN accumulator, so no two matmuls share a
+     *   buffer and completion order cannot reach the arithmetic. The weighted
+     *   sum into `out` runs afterwards, strictly in k order. Float addition is
+     *   not associative, so that ordering is the entire guarantee --
+     *   accumulating as each expert lands would be faster still and would
+     *   silently produce a different model.
+     *
+     *   expert_forward's own scratch (expert_gate/up/out) IS shared, so the
+     *   matmuls stay sequential with respect to each other. Only the reads run
+     *   concurrently with them.
+     *
+     * expert_acc must never alias the MoE input. x1 IS the MoE input `x` at
+     * every call site, so writing an expert's output there corrupted the input
+     * for every later expert and for the shared expert too. That was a live
+     * bug; per-kernel gates could not see it, and the whole-block oracle
+     * caught it.
+     */
     const DSV4ExpertW *ex[DSV4_MAX_TOPK];
+    int done[DSV4_MAX_TOPK];
+    for (int k = 0; k < c->topk; k++) { ex[k] = NULL; done[k] = 0; }
+
+    const int overlapped = (src->begin && src->end);
+
     t0 = pnow();
-    if (src->get_many) {
-        src->get_many(src->ctx, layer, s->topk_idx, c->topk, ex);
-    } else {
-        for (int k = 0; k < c->topk; k++)
-            ex[k] = src->get(src->ctx, layer, s->topk_idx[k]);
-    }
+    if (overlapped)         src->begin(src->ctx, layer, s->topk_idx, c->topk, ex);
+    else if (src->get_many) src->get_many(src->ctx, layer, s->topk_idx, c->topk, ex);
+    else for (int k = 0; k < c->topk; k++)
+             ex[k] = src->get(src->ctx, layer, s->topk_idx[k]);
     dsv4_prof.expert_io += pnow() - t0;
+
+    if (overlapped) {
+        /* The residents, while the misses are still on the wire. */
+        t0 = pnow();
+        for (int k = 0; k < c->topk; k++) {
+            if (!ex[k]) continue;
+            expert_forward(s->expert_acc + (size_t)k * s->expert_acc_stride,
+                           x, ex[k], s, c->hidden, c->moe_inter,
+                           c->swiglu_limit);
+            done[k] = 1;
+        }
+        dsv4_prof.expert_mm += pnow() - t0;
+
+        /* Whatever the drive still owes. Counted as I/O because that is what it
+         * is: time this thread spent blocked with nothing left to overlap. As
+         * the overlap works this shrinks, which makes expert_io the number to
+         * watch rather than the wall clock. */
+        t0 = pnow();
+        src->end(src->ctx, ex);
+        dsv4_prof.expert_io += pnow() - t0;
+    }
 
     t0 = pnow();
     for (int k = 0; k < c->topk; k++) {
@@ -406,7 +451,7 @@ static void moe(float *out, const float *x, const DSV4LayerW *w,
              * a different model, producing fluent and wrong output.
              *
              * This used to `continue`. Running Flash at --budget 3 left the
-             * cache with 5 slots against a top-k of 6, and the fourth generated
+             * cache with 5 slots against a top-k of 6 and the fourth generated
              * token silently changed. The cache now refuses such a budget up
              * front; this is the second line of defence, because a wrong answer
              * that looks right is the worst failure this engine can have. */
@@ -416,10 +461,16 @@ static void moe(float *out, const float *x, const DSV4LayerW *w,
                     layer, k + 1, c->topk);
             abort();
         }
-        expert_forward(s->expert_acc, x, ex[k], s, c->hidden, c->moe_inter,
-                       c->swiglu_limit);
+        if (!done[k])
+            expert_forward(s->expert_acc + (size_t)k * s->expert_acc_stride,
+                           x, ex[k], s, c->hidden, c->moe_inter,
+                           c->swiglu_limit);
+    }
+    /* IN k ORDER, ALWAYS -- see the note above. */
+    for (int k = 0; k < c->topk; k++) {
+        const float *acc = s->expert_acc + (size_t)k * s->expert_acc_stride;
         const float wk = s->topk_w[k];
-        for (int i = 0; i < c->hidden; i++) out[i] += wk * s->expert_acc[i];
+        for (int i = 0; i < c->hidden; i++) out[i] += wk * acc[i];
     }
     dsv4_prof.expert_mm += pnow() - t0;
 

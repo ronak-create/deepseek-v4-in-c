@@ -209,7 +209,10 @@ static int run_case(const char *file, const char *label)
 
     DSV4Scratch s;
     if (dsv4_scratch_init(&s, &c, 128) != 0) { printf("  FAIL  scratch\n"); return 1; }
-    DSV4ExpertSrc src = { get_expert, NULL, NULL };
+    /* Named, so adding a member to DSV4ExpertSrc cannot silently
+     * shift what this gate is testing. get() only: these gates check
+     * the arithmetic, and the fetch path has its own. */
+    DSV4ExpertSrc src = { .get = get_expert };
 
     static float h[1024];
     DSV4LayerState lstate;

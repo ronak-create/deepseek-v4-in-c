@@ -31,6 +31,7 @@
 #ifndef DSV4_CACHE_H
 #define DSV4_CACHE_H
 
+#include <pthread.h>
 #include <stdio.h>
 
 #include "dsv4.h"
@@ -102,6 +103,25 @@ typedef struct {
      * one reason -- the cache policy should be chosen from a measured access
      * trace, not from an argument about what routing probably looks like. */
     FILE *route_log;
+
+    /* READER POOL -- see dsv4_cache_get_many_begin.
+     *
+     * A small set of threads that exist only to sit inside pread(). They are
+     * pthreads and not an OpenMP team on purpose: the caller is expected to be
+     * running its own full-width OpenMP matmul at the same time, and an inner
+     * parallel region opened from inside that would either collapse to one
+     * thread or oversubscribe every core. These threads are almost always
+     * blocked on the device, so they cost the matmul close to nothing.
+     *
+     * Created once at cache init, not per layer: a token touches 43 layers, so
+     * per-batch thread creation would be ~6,700 clone() calls in a 26-token
+     * run for no reason. */
+    pthread_t      *rth;
+    int             nrth;
+    pthread_mutex_t rmx;
+    pthread_cond_t  rwork, rdone;
+    struct DSV4CacheBatch *rbatch;   /* the batch in flight, NULL when idle */
+    int             rnext, rdone_n, rshutdown;
 
     /* stats */
     uint64_t hits, misses, evictions;
@@ -196,6 +216,58 @@ const DSV4ExpertW *dsv4_cache_get(DSV4Cache *c, int layer, int expert);
  * expert loaded. */
 int dsv4_cache_get_many(DSV4Cache *c, int layer, const int *experts, int n,
                         const DSV4ExpertW **out);
+
+/* ---------------------------------------------------- overlapped fetching ---
+ * dsv4_cache_get_many with the wait pulled apart, so a caller can compute
+ * against the experts it already has while the ones it does not are read.
+ *
+ * WHY THIS IS WORTH THE EXTRA API
+ *   Before this existed, a layer's MoE was a hard barrier: read all six
+ *   experts, THEN run all six matmuls. Disk and expert matmul are the two
+ *   largest movable components in the profile and they were strictly
+ *   serialised, while the hit rate at a realistic budget is around 50% -- so
+ *   roughly half the matmuls could have run during the reads and did not.
+ *
+ *   begin() does the entire serial decide pass exactly as get_many does, fills
+ *   out[k] for every HIT immediately, leaves out[k] NULL for every miss, and
+ *   hands the misses to the reader pool. end() waits for the pool and fills in
+ *   the rest. Between the two calls the caller owns the CPU.
+ *
+ * WHAT IS AND IS NOT PROMISED
+ *   Every decision that touches cache state -- hit or miss, which slot is
+ *   evicted, what stamp each entry gets -- is still made inside begin(), in
+ *   request order, before a byte is read. So cache state after end() does not
+ *   depend on read completion order, exactly as before.
+ *
+ *   The caller must NOT accumulate expert outputs in completion order. Compute
+ *   each k into its OWN accumulator and sum them in k order afterwards, or the
+ *   result stops being bit-identical for a reason that has nothing to do with
+ *   this cache.
+ *
+ *   One batch per cache at a time. begin() must be followed by end() before the
+ *   next begin(); nothing else may touch the cache in between.
+ *
+ * A batch is an opaque handle the caller allocates (usually on the stack). */
+typedef struct DSV4CacheBatch DSV4CacheBatch;
+struct DSV4CacheBatch {
+    int layer, n, ntodo;
+    int slot_of[DSV4_MAX_TOPK];         /* slot each pending read fills   */
+    int k_of[DSV4_MAX_TOPK];            /* which request that read serves */
+    const DSV4Tensor *t_of[DSV4_MAX_TOPK][6];
+    int expert_of[DSV4_MAX_TOPK];
+    int failed[DSV4_MAX_TOPK];
+    uint64_t got[DSV4_MAX_TOPK];
+    /* Requests that asked for an expert another request in the same batch is
+     * already reading. They cannot be answered until that read lands. */
+    int ndup, dup_k[DSV4_MAX_TOPK], dup_j[DSV4_MAX_TOPK];
+    int rc;
+};
+
+int dsv4_cache_get_many_begin(DSV4Cache *c, int layer, const int *experts,
+                              int n, const DSV4ExpertW **out,
+                              DSV4CacheBatch *b);
+int dsv4_cache_get_many_end(DSV4Cache *c, const DSV4ExpertW **out,
+                            DSV4CacheBatch *b);
 
 void dsv4_cache_reset_stats(DSV4Cache *c);
 void dsv4_cache_report(const DSV4Cache *c, const char *label);

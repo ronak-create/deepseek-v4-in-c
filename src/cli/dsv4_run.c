@@ -57,6 +57,24 @@ static int dsv4_run_get_experts(void *ctx, int layer, const int *e, int n,
     return dsv4_cache_get_many((DSV4Cache *)ctx, layer, e, n, out);
 }
 
+/* The overlapped pair. The batch is file-scope because exactly one is in flight
+ * at a time -- moe() calls begin then end with nothing in between that could
+ * start another, and the layers run one after the other. Making it a parameter
+ * would put a cache type in dsv4_layer.h for no gain. */
+static DSV4CacheBatch g_batch;
+
+static int dsv4_run_begin_experts(void *ctx, int layer, const int *e, int n,
+                                  const DSV4ExpertW **out)
+{
+    return dsv4_cache_get_many_begin((DSV4Cache *)ctx, layer, e, n, out,
+                                     &g_batch);
+}
+
+static int dsv4_run_end_experts(void *ctx, const DSV4ExpertW **out)
+{
+    return dsv4_cache_get_many_end((DSV4Cache *)ctx, out, &g_batch);
+}
+
 static double now_s(void)
 {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -286,7 +304,9 @@ int main(int argc, char **argv)
     for (int L = 0; L < c.n_layers; L++)
         if (dsv4_state_init(&lst[L], &c, L, maxpos) != 0) return 1;
 
-    DSV4ExpertSrc src = { dsv4_run_get_expert, dsv4_run_get_experts, &cache };
+    DSV4ExpertSrc src = { dsv4_run_get_expert, dsv4_run_get_experts,
+                          dsv4_run_begin_experts, dsv4_run_end_experts,
+                          &cache };
 
     /* ---- chat encoding, per the checkpoint's own encoding/README.md ----
      *

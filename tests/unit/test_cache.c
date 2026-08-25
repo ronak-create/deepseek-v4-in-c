@@ -232,6 +232,71 @@ int main(void)
         dsv4_cache_free(&b);
     }
 
+    printf("\n-- GATE 8  begin() hands back residents that are USABLE before end() --\n");
+    {
+        /* The contract dsv4_cache_get_many_begin adds is that the experts it
+         * returns immediately are complete, and stay complete while the misses
+         * are still being read. moe() depends on exactly that: it runs those
+         * matmuls in the gap. If a resident could be disturbed by an in-flight
+         * read -- evicted, rebound, written through -- the model would produce
+         * wrong tokens only under timing, which is the worst way to find out.
+         *
+         * So: warm three experts, then ask for six. The three residents are
+         * copied out DURING the gap and compared afterwards against a serial
+         * reference. Anything the readers do to them shows up as a mismatch. */
+        const int warm[3] = { 1, 3, 5 };
+        const int ids[6]  = { 0, 1, 2, 3, 4, 5 };
+
+        DSV4Cache a, b;
+        dsv4_cache_init(&a, &st, &c, 1LL << 30);
+        dsv4_cache_init(&b, &st, &c, 1LL << 30);
+        for (int i = 0; i < 3; i++) dsv4_cache_get(&b, 2, warm[i]);
+
+        const DSV4ExpertW *ex[6];
+        DSV4CacheBatch bat;
+        const int rc = dsv4_cache_get_many_begin(&b, 2, ids, 6, ex, &bat);
+        CHECK(rc == 0, "begin reported failure (%d)", rc);
+
+        /* In the gap. Exactly what moe() does here, minus the arithmetic. */
+        int nres = 0;
+        unsigned char *snap[6];
+        int64_t snapn[6];
+        for (int k = 0; k < 6; k++) {
+            snap[k] = NULL; snapn[k] = 0;
+            if (!ex[k]) continue;
+            nres++;
+            snapn[k] = (int64_t)ex[k]->w1.rows * ex[k]->w1.cols / 2;
+            snap[k] = (unsigned char *)malloc((size_t)snapn[k]);
+            if (snap[k]) memcpy(snap[k], ex[k]->w1.w, (size_t)snapn[k]);
+        }
+        CHECK(nres == 3, "expected 3 residents before end(), got %d", nres);
+
+        const int rc2 = dsv4_cache_get_many_end(&b, ex, &bat);
+        CHECK(rc2 == 0, "end reported failure (%d)", rc2);
+
+        int bad8 = 0;
+        for (int k = 0; k < 6; k++) {
+            const DSV4ExpertW *one = dsv4_cache_get(&a, 2, ids[k]);
+            if (!one || !ex[k]) { CHECK(0, "expert %d missing", ids[k]); continue; }
+            const int64_t nb = (int64_t)one->w1.rows * one->w1.cols / 2;
+            if (memcmp(one->w1.w, ex[k]->w1.w, (size_t)nb) != 0) {
+                CHECK(0, "expert %d differs from the serial path", ids[k]); bad8++;
+            }
+            /* And the resident's bytes must not have MOVED during the gap. */
+            if (snap[k] && memcmp(snap[k], ex[k]->w1.w, (size_t)snapn[k]) != 0) {
+                CHECK(0, "resident expert %d changed while misses were read",
+                      ids[k]);
+                bad8++;
+            }
+            free(snap[k]);
+        }
+        if (!bad8 && rc == 0 && rc2 == 0)
+            printf("  ok    3 residents usable in the gap and unchanged by it, "
+                   "all 6 match the serial path\n");
+        dsv4_cache_free(&a);
+        dsv4_cache_free(&b);
+    }
+
     dsv4_st_close(&st);
     printf("\n");
     if (fails) { printf("CACHE GATE FAILED: %d check(s)\n", fails); return 1; }

@@ -114,7 +114,7 @@ comment never disagree.
 
 ## Tier 2 — engine work with a bounded, measurable payoff
 
-### 6. Overlap expert compute with expert I/O
+### 6. Overlap expert compute with expert I/O — DONE
 **From:** `desexmachina` — "have you tried RAM as an intermediate streamer". The
 honest answer given in-thread was that there is no double buffering: a miss
 blocks until the read finishes.
@@ -135,6 +135,28 @@ untouched.
 *Verify:* the existing bit-exactness gates plus identical token ids against the
 current build on the same prompt; then an interleaved cold A/B on s/token and on
 `dsv4_prof.expert_io`.
+
+**Done 2026-08-25.** Built as designed: `dsv4_cache_get_many` split into
+`begin`/`end`, misses handed to a pthread reader pool, one accumulator per `k`,
+weighted sum still in `k` order. 21/21 gates green plus a new cache gate 8 for
+the contract `begin()` adds; identical token ids and identical
+hit/miss/eviction/bytes-read counts in every A/B run.
+
+Measured over nine interleaved runs at `--budget 16 --gpu`, alternating which
+build ran first: exposed I/O **-34%** (523.6 → 346.2 ms/pass), wall clock
+**-10%** (1.45 → 1.31 s/token mean), and the spread cut from 1.13–1.86 down to
+1.19–1.44. Below the estimated 16% ceiling, for a measured reason: a third
+build isolating the per-`k` refactor from the overlap shows the refactor costs
+nothing, while the overlap costs **+34% on the expert matmul** — NVMe DMA
+contending with a memory-bound FP4 matmul. That is the same mechanism the README
+names as the unmeasured suspect behind the GPU contention collapse, now observed
+with no GPU in the picture.
+
+**And it does nothing at `--budget 4`**, where the hit rate is exactly 0% so
+there are no residents to compute during the reads. Measured, identical both
+ways. The payoff is proportional to the hit rate — which is the argument for
+item 7, since exact hash-layer prefetch manufactures overlappable work on
+precisely the configurations that have none.
 
 ### 7. Exact prefetch for the hash layers
 **From:** the `tid2eid` exception this repo already documents but never uses.

@@ -519,6 +519,94 @@ Attention — the component that is actually on the device — falls about 30%.
 Wall clock falls about 12%; the disk fraction cannot move and it swings more
 than that from run to run, which is why the components are the number to trust.
 
+## Overlapping the resident experts' matmuls with the streamed ones' reads
+
+The MoE used to be a hard barrier: fetch all six of a layer's top-k experts,
+*then* run all six matmuls. Expert disk and expert matmul are two of the three
+largest movable components in the profile and they were strictly serialised,
+while at `--budget 16` about half the top-k is already resident. So about half
+the matmuls could have run during the reads, and did not.
+
+`dsv4_cache_get_many` is now split. `begin()` does the whole decide pass, hands
+back every resident expert immediately, and gives the misses to a small pool of
+pthreads whose only job is to sit in `pread()`. `end()` waits for what is left.
+Between the two, `moe()` runs the residents' matmuls on the full OpenMP team.
+
+The reader pool is pthreads and not an OpenMP team on purpose: an inner parallel
+region opened from inside the matmul's own region would either collapse to one
+thread — taking the reads to queue depth one, which
+[the sweep](#is-the-read-path-queue-depth-bound-no-and-that-closes-a-whole-roadmap-item)
+prices at 25% — or oversubscribe every core against the work it is meant to hide
+behind.
+
+**Bit-exactness comes from where the sum happens, not where the matmul happens.**
+Each `k` computes into its own accumulator, so completion order cannot reach the
+arithmetic; the weighted sum into the block output runs afterwards, strictly in
+`k` order. Accumulating as each expert lands would be faster still and would
+silently produce a different model.
+
+### What it actually bought
+
+Three-way interleaved, `--gen 15 --budget 16 --gpu`, **identical token ids and
+identical hit/miss/eviction/bytes-read counts in every run**. B is the same
+build as C with the overlap switched off, so it isolates the per-`k` accumulator
+refactor from the overlap itself:
+
+| ms/pass | round 1 | round 2 | round 3 | mean |
+|---|---|---|---|---|
+| **exposed disk** — A barrier | 590.1 | 480.8 | 499.9 | 523.6 |
+| — B per-`k` acc, no overlap | 625.2 | 511.4 | 551.3 | 562.6 |
+| — **C overlap** | **349.2** | **357.4** | **331.9** | **346.2** |
+| **expert matmul** — A barrier | 517.1 † | 284.5 | 344.6 | 382.1 |
+| — B per-`k` acc, no overlap | 353.8 | 307.5 | 281.9 | 314.4 |
+| — C overlap | 405.5 | 423.8 | 416.7 | 415.3 |
+
+† round 1 A is cold; the disk row shows the same run 20% above its own later
+values.
+
+Two things fall out of the B row. The per-`k` accumulator refactor costs
+**nothing** — B's matmul is if anything below A's. And the overlap's matmul cost
+is therefore not the refactor: it is **DMA contending with a memory-bound FP4
+matmul**, +34% on the matmul while the drive is streaming into cache slots.
+
+That is worth pausing on. This page already names DMA-versus-DRAM contention as
+the leading unmeasured suspect for
+[the GPU contention collapse](#the-gpu-needs-a-spare-core). Here is the same
+mechanism with no GPU involved at all: NVMe DMA into resident slots slows a
+CPU-only FP4 matmul by a third. It does not prove the GPU case, but it stops
+being a hypothesis with nothing behind it.
+
+Net over **nine** interleaved runs, alternating which build goes first so the
+machine's warming cannot favour either:
+
+| | barrier | overlap |
+|---|---|---|
+| s/token, nine runs | 1.67 1.40 1.24 1.13 1.28 1.80 1.86 1.25 1.43 | 1.44 1.21 1.19 1.42 1.26 1.26 1.29 1.34 1.34 |
+| mean | 1.45 | **1.31** |
+| spread | 1.13 – 1.86 | 1.19 – 1.44 |
+
+**About 10% on the wall clock**, and — arguably the more useful part — a third
+of the spread. Decoupling the wall clock from the drive's variance is what makes
+the run predictable.
+
+### Where it does nothing, and why that was predictable
+
+At `--budget 4` the expert cache hit rate is **exactly 0%**: the budget is below
+one forward pass's working set, so every entry is evicted before its layer comes
+round again (the threshold is documented under
+[Choose `--budget`](#choose---budget-deliberately)). With no residents there is
+nothing to compute during the reads, and the overlap has nothing to hide behind:
+
+| `--budget 4 --gpu` | barrier | overlap |
+|---|---|---|
+| exposed disk, ms/pass | 854.8 / 845.9 | 845.4 / 854.9 |
+| s/token | 2.79 / 2.56 | 2.68 / 2.68 |
+
+Identical, as it should be. **The overlap's payoff is proportional to the hit
+rate** — it is worth ~10% at 50% hits and worth nothing at 0%. That is the
+argument for the exact hash-layer prefetch: it manufactures work to overlap
+against on exactly the configurations where there is none.
+
 ## The GPU needs a spare core
 
 `bench/gpu_contention.c` times the same CPU-only FP4 matmul with the device idle

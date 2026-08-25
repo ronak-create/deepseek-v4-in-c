@@ -157,7 +157,10 @@ int main(void)
             sn[t * (RD / 2) + i] = sinf((float)t * 0.1f);
         }
 
-    DSV4ExpertSrc src = { get_expert, NULL, NULL };
+    /* Named, so adding a member to DSV4ExpertSrc cannot silently
+     * shift what this gate is testing. get() only: these gates check
+     * the arithmetic, and the fetch path has its own. */
+    DSV4ExpertSrc src = { .get = get_expert };
 
     printf("\n-- GATE 1  a block runs and keeps the stream finite --\n");
     {
