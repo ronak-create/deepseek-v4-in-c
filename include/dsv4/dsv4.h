@@ -68,6 +68,19 @@
 
 /* Bounds the fixed-size routing arrays. Both released models use top-6. */
 #define DSV4_MAX_TOPK      16
+
+/* Prompt tokens processed together by the batched (GEMM) prefill path.
+ *
+ * A cap and not a tuning parameter. It bounds a per-thread stack array in the
+ * batched matmuls, and it bounds the KV rows a single batched attention step
+ * has to reason about. Prompts longer than this are prefilled in chunks of
+ * this size, which changes nothing about the result -- the reuse a GEMM gets
+ * is already near its ceiling well before 64 (measured 7.99x at a 207-token
+ * prompt, and the curve is a logarithm, not a line).
+ *
+ * Raising it costs stack in every matmul thread and widens the batched
+ * activation buffers; it does not unlock proportional speed. */
+#define DSV4_MAX_BATCH     64
 #define DSV4_MAX_LAYERS    128
 #define DSV4_MAX_HC_MULT   8
 

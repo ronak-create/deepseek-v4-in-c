@@ -244,6 +244,24 @@ static double *widen_x(const float *x, int in)
     return d;
 }
 
+/* The same widening for a BATCH of nt activation vectors, laid out [nt][in].
+ *
+ * One allocation rather than nt of them: at Pro's 16384 reduce dimension and a
+ * 64-token batch this is 8 MB, and taking it from the allocator once per GEMM
+ * instead of once per token is the difference between an allocation that does
+ * not show up in a profile and 64 that do. */
+static double *widen_xn(const float *x, int in, int nt)
+{
+    double *d = (double *)malloc((size_t)in * (size_t)nt * sizeof *d);
+    if (!d) {
+        fprintf(stderr, "dsv4_matmul: could not widen %d x %d activations\n",
+                nt, in);
+        return NULL;
+    }
+    for (size_t i = 0; i < (size_t)in * (size_t)nt; i++) d[i] = (double)x[i];
+    return d;
+}
+
 /* The scalar tree, called with the vector signature so one body serves both. */
 #define BLOCK_DOT_S2(LOAD1, LOAD4) BLOCK_DOT_S(LOAD1)
 
@@ -326,10 +344,124 @@ void dsv4_matmul_fp4##SUF(float *y, const float *x, const uint8_t *W,          \
     free(xd);                                                                  \
 }
 
+/* ------------------------------------------------------- BATCHED (GEMM) ---
+ * The same three kernels with a batch of nt activation vectors instead of one.
+ *
+ * WHY THIS IS THE WHOLE POINT OF PREFILL
+ *   A GEMV reads a weight matrix once and does one multiply-add per weight:
+ *   arithmetic intensity ~1 flop per byte, so it is bound by how fast the
+ *   weights arrive, not by the arithmetic. Feed nt tokens through the SAME
+ *   loaded weights and the intensity becomes ~nt. That is the entire mechanism.
+ *
+ *   The loop order below is what delivers it. For FP8 and FP4 the token loop is
+ *   INSIDE the scale-block loop, so one 128-column block of weights is loaded
+ *   and consumed by all nt tokens before the next block is touched. For BF16
+ *   there are no blocks, so the token loop sits inside the row loop and the row
+ *   (8 KB at in=4096) stays in L1 across the batch.
+ *
+ * WHY IT IS BIT-EXACT, AND WHY THAT IS NOT A HOPE
+ *   These do not compute the dot product differently. They invoke the SAME
+ *   BLOCK_DOT macro, over the same columns, in the same order, with the same
+ *   16-accumulator tree -- once per (row, token) pair, exactly as nt separate
+ *   GEMV calls would. Only the order in which those independent dot products
+ *   are issued changes, and independent results do not interact.
+ *
+ *   The one thing that had to be watched is the per-block scale. The GEMV
+ *   folds it as `total += acc * (double)dsv4_e8m0_to_f32(S[...])`. Here the
+ *   conversion is hoisted out of the token loop -- same value, computed once
+ *   instead of nt times -- and the fold stays `total[t] += acc * s` in the same
+ *   c0 order. Hoisting a value is not the same as reassociating a sum.
+ *
+ *   The matmul gate checks this at runtime against nt separate GEMV calls
+ *   rather than trusting the paragraph above.
+ */
+#define GEN_MATMULS_N(SUF, DOT, DOT4)                                          \
+                                                                               \
+void dsv4_matmul_bf16_n##SUF(float *y, const float *x, const uint16_t *W,      \
+                             int in, int out, int nt)                          \
+{                                                                              \
+    double *xd = widen_xn(x, in, nt);                                          \
+    if (!xd) return;                                                           \
+    _Pragma("omp parallel for schedule(static) if (out > 64)")                 \
+    for (int o = 0; o < out; o++) {                                            \
+        const uint16_t *row = W + (size_t)o * in;                              \
+        const int n = in;                                                      \
+        for (int t = 0; t < nt; t++) {                                         \
+            const float  *xb  = x  + (size_t)t * in;                           \
+            const double *xdb = xd + (size_t)t * in; (void)xdb;                \
+            double acc;                                                        \
+            DOT(LOAD1_BF16, LOAD4_BF16);                                       \
+            y[(size_t)t * out + o] = (float)acc;                               \
+        }                                                                      \
+    }                                                                          \
+    free(xd);                                                                  \
+}                                                                              \
+                                                                               \
+void dsv4_matmul_fp8_n##SUF(float *y, const float *x, const uint8_t *W,        \
+                            const uint8_t *S, int in, int out,                 \
+                            int blk_r, int blk_c, int nt)                      \
+{                                                                              \
+    const int sc = (in + blk_c - 1) / blk_c;                                   \
+    double *xd = widen_xn(x, in, nt);                                          \
+    if (!xd) return;                                                           \
+    _Pragma("omp parallel for schedule(static) if (out > 64)")                 \
+    for (int o = 0; o < out; o++) {                                            \
+        const uint8_t *rw = W + (size_t)o * in;                                \
+        double total[DSV4_MAX_BATCH];                                          \
+        for (int t = 0; t < nt; t++) total[t] = 0.0;                           \
+        for (int c0 = 0; c0 < in; c0 += blk_c) {                               \
+            const int n = (in - c0 < blk_c) ? (in - c0) : blk_c;               \
+            const uint8_t *wb = rw + c0;                                       \
+            const double s = (double)dsv4_e8m0_to_f32(                         \
+                        S[(o / blk_r) * (size_t)sc + (c0 / blk_c)]);           \
+            for (int t = 0; t < nt; t++) {                                     \
+                const float  *xb  = x  + (size_t)t * in + c0;                  \
+                const double *xdb = xd + (size_t)t * in + c0; (void)xdb;       \
+                double acc;                                                    \
+                DOT(LOAD1_FP8, LOAD4_FP8);                                     \
+                total[t] += acc * s;                                           \
+            }                                                                  \
+        }                                                                      \
+        for (int t = 0; t < nt; t++) y[(size_t)t * out + o] = (float)total[t]; \
+    }                                                                          \
+    free(xd);                                                                  \
+}                                                                              \
+                                                                               \
+void dsv4_matmul_fp4_n##SUF(float *y, const float *x, const uint8_t *W,        \
+                            const uint8_t *S, int in, int out,                 \
+                            int blk_r, int blk_c, int nt)                      \
+{                                                                              \
+    const int sc = (in + blk_c - 1) / blk_c;                                   \
+    double *xd = widen_xn(x, in, nt);                                          \
+    if (!xd) return;                                                           \
+    _Pragma("omp parallel for schedule(static) if (out > 64)")                 \
+    for (int o = 0; o < out; o++) {                                            \
+        const uint8_t *row = W + (size_t)o * ((size_t)in / 2);                 \
+        double total[DSV4_MAX_BATCH];                                          \
+        for (int t = 0; t < nt; t++) total[t] = 0.0;                           \
+        for (int c0 = 0; c0 < in; c0 += blk_c) {                               \
+            const int n = (in - c0 < blk_c) ? (in - c0) : blk_c;               \
+            const double s = (double)dsv4_e8m0_to_f32(                         \
+                        S[(o / blk_r) * (size_t)sc + (c0 / blk_c)]);           \
+            for (int t = 0; t < nt; t++) {                                     \
+                const float  *xb  = x  + (size_t)t * in + c0;                  \
+                const double *xdb = xd + (size_t)t * in + c0; (void)xdb;       \
+                double acc;                                                    \
+                DOT4(LOAD1_FP4, LOAD4_FP4);                                    \
+                total[t] += acc * s;                                           \
+            }                                                                  \
+        }                                                                      \
+        for (int t = 0; t < nt; t++) y[(size_t)t * out + o] = (float)total[t]; \
+    }                                                                          \
+    free(xd);                                                                  \
+}
+
 GEN_MATMULS(_scalar, BLOCK_DOT_S2, BLOCK_DOT_S2)
+GEN_MATMULS_N(_scalar, BLOCK_DOT_S2, BLOCK_DOT_S2)
 
 #if defined(__AVX2__) && defined(__FMA__)
 GEN_MATMULS(_avx2, BLOCK_DOT_V, BLOCK_DOT_V_FP4)
+GEN_MATMULS_N(_avx2, BLOCK_DOT_V, BLOCK_DOT_V_FP4)
 #define PICK(name) name##_avx2
 int dsv4_matmul_has_avx2(void) { return 1; }
 #else
@@ -354,6 +486,26 @@ void dsv4_matmul_fp4(float *y, const float *x, const uint8_t *W,
                      const uint8_t *S, int in, int out, int blk_r, int blk_c)
 {
     PICK(dsv4_matmul_fp4)(y, x, W, S, in, out, blk_r, blk_c);
+}
+
+void dsv4_matmul_bf16_n(float *y, const float *x, const uint16_t *W,
+                        int in, int out, int nt)
+{
+    PICK(dsv4_matmul_bf16_n)(y, x, W, in, out, nt);
+}
+
+void dsv4_matmul_fp8_n(float *y, const float *x, const uint8_t *W,
+                       const uint8_t *S, int in, int out, int blk_r, int blk_c,
+                       int nt)
+{
+    PICK(dsv4_matmul_fp8_n)(y, x, W, S, in, out, blk_r, blk_c, nt);
+}
+
+void dsv4_matmul_fp4_n(float *y, const float *x, const uint8_t *W,
+                       const uint8_t *S, int in, int out, int blk_r, int blk_c,
+                       int nt)
+{
+    PICK(dsv4_matmul_fp4_n)(y, x, W, S, in, out, blk_r, blk_c, nt);
 }
 
 /* ---------------------------------------------------------------- dispatch --
@@ -388,6 +540,47 @@ void dsv4_mmq(float *y, const float *x, const DSV4QMat *m)
         /* Reaching here means a matrix was bound with a tag nothing implements.
          * Producing zeros would be a running model with a missing projection. */
         fprintf(stderr, "dsv4_mmq: matrix has unimplemented wdt %d "
+                        "(%dx%d)\n", m->wdt, m->rows, m->cols);
+        abort();
+    }
+}
+
+/* The batched dispatch. x is [nt][cols], y is [nt][rows], both row-major.
+ *
+ * nt == 1 is forwarded to the GEMV rather than handled here. Not for speed --
+ * the batched kernel at nt == 1 is the same arithmetic -- but so that the
+ * single-token decode path, which is every token after the prompt, cannot
+ * accidentally start running through a different code path than the one the
+ * whole-model oracle gates.
+ *
+ * NO GPU BRANCH, deliberately. dsv4_cuda_mmq uploads one activation vector and
+ * returns one result vector; a batched device path is a separate piece of work
+ * with its own gate, and silently falling back to nt GEMV calls on the device
+ * would give up exactly the reuse this function exists to get. Prefill runs on
+ * the CPU until that is built. */
+void dsv4_mmq_n(float *y, const float *x, const DSV4QMat *m, int nt)
+{
+    if (nt <= 1) { dsv4_mmq(y, x, m); return; }
+    if (nt > DSV4_MAX_BATCH) {
+        fprintf(stderr, "dsv4_mmq_n: batch %d exceeds DSV4_MAX_BATCH %d\n",
+                nt, DSV4_MAX_BATCH);
+        abort();
+    }
+
+    switch (m->wdt) {
+    case DSV4_WBF16:
+        dsv4_matmul_bf16_n(y, x, (const uint16_t *)m->w, m->cols, m->rows, nt);
+        break;
+    case DSV4_WFP8:
+        dsv4_matmul_fp8_n(y, x, (const uint8_t *)m->w, (const uint8_t *)m->s,
+                          m->cols, m->rows, m->blk_r, m->blk_c, nt);
+        break;
+    case DSV4_WFP4:
+        dsv4_matmul_fp4_n(y, x, (const uint8_t *)m->w, (const uint8_t *)m->s,
+                          m->cols, m->rows, m->blk_r, m->blk_c, nt);
+        break;
+    default:
+        fprintf(stderr, "dsv4_mmq_n: matrix has unimplemented wdt %d "
                         "(%dx%d)\n", m->wdt, m->rows, m->cols);
         abort();
     }

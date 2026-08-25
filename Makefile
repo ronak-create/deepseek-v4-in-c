@@ -228,12 +228,17 @@ test: $(BIN)/test_cuda $(BIN)/test_pro $(BIN)/test_cfg $(BIN)/test_st $(BIN)/tes
 # The README tells you to run these, so something has to build them. They link
 # the same objects with the same CFLAGS as the engine -- a bench built with
 # different flags measures a different program.
-BENCHBIN := $(BIN)/matmul_bw $(BIN)/gpu_contention $(BIN)/gpu_call $(BIN)/cache_bw
+BENCHBIN := $(BIN)/matmul_bw $(BIN)/gemm_bw $(BIN)/gpu_contention $(BIN)/gpu_call $(BIN)/cache_bw
 bench: $(BENCHBIN)
 
 $(BIN)/matmul_bw: bench/matmul_bw.c src/core/dsv4_matmul.c $(DSV4_CUDA_OBJ)
 	@mkdir -p $(BIN)
 	$(CC) $(CFLAGS) $(INCS) bench/matmul_bw.c src/core/dsv4_matmul.c 	      $(DSV4_CUDA_SRC) $(DSV4_CUDA_OBJ) -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
+
+$(BIN)/gemm_bw: bench/gemm_bw.c src/core/dsv4_matmul.c $(DSV4_CUDA_OBJ)
+	@mkdir -p $(BIN)
+	$(CC) $(CFLAGS) $(INCS) bench/gemm_bw.c src/core/dsv4_matmul.c \
+	      $(DSV4_CUDA_SRC) $(DSV4_CUDA_OBJ) -o $@ $(LDFLAGS) $(LDLIBS_EXTRA)
 
 $(BIN)/gpu_contention: bench/gpu_contention.c src/core/dsv4_matmul.c $(DSV4_CUDA_OBJ)
 	@mkdir -p $(BIN)

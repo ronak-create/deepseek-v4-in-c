@@ -38,6 +38,7 @@ void dsv4_mmq(float *, const float *, const DSV4QMat *);
 void dsv4_matmul_bf16_scalar(float *, const float *, const uint16_t *, int, int);
 void dsv4_matmul_fp8_scalar(float *, const float *, const uint8_t *,
                             const uint8_t *, int, int, int, int);
+void dsv4_mmq_n(float *, const float *, const DSV4QMat *, int);
 void dsv4_matmul_fp4_scalar(float *, const float *, const uint8_t *,
                             const uint8_t *, int, int, int, int);
 int  dsv4_matmul_has_avx2(void);
@@ -313,6 +314,105 @@ int main(void)
                    "%d x %d\n", OUT, IN);
     }
 
+
+    printf("\n-- GATE  the batched GEMM equals nt separate GEMVs, bit for bit --\n");
+    {
+        /* This is the property the whole prefill change rests on. dsv4_mmq_n
+         * reorders WHEN each dot product is issued so that one loaded weight
+         * block serves every token in the batch -- and reordering independent
+         * work is only safe if the work really is independent. If it is not,
+         * the failure mode is a prompt that produces slightly different logits
+         * and therefore, eventually, a different token: fluent, plausible, and
+         * wrong. So this compares bit patterns.
+         *
+         * Every weight format, because they fold the per-block scale
+         * differently and the batched kernels hoist that fold out of the token
+         * loop. A batch size that is not a multiple of anything, so no tail is
+         * skipped. Activations that differ per token, so a kernel that
+         * broadcast token 0 across the batch could not pass. */
+        enum { IN = 256, OUT = 37, NT = 5 };
+        static float xb[NT * IN], ybatch[NT * OUT], yone[OUT];
+        static uint8_t W8[(size_t)OUT * IN], W4[(size_t)OUT * IN / 2];
+        static uint16_t Wb[(size_t)OUT * IN];
+        static uint8_t S8[OUT * 2], S4[(size_t)OUT * (IN / 32)];
+
+        unsigned r = 777u;
+        for (int i = 0; i < NT * IN; i++) {
+            r = r * 1103515245u + 12345u;
+            xb[i] = (float)((int)((r >> 16) & 0xffff) - 32768) * 1e-3f;
+        }
+        for (size_t i = 0; i < sizeof W8; i++) {
+            r = r * 1103515245u + 12345u;
+            uint8_t b = (uint8_t)(r >> 16);
+            if ((b & 0x7Fu) == 0x7Fu) b &= 0xFEu;      /* never a NaN weight */
+            W8[i] = b;
+        }
+        for (size_t i = 0; i < sizeof W4; i++) {
+            r = r * 1103515245u + 12345u;
+            W4[i] = (uint8_t)(r >> 16);
+        }
+        for (size_t i = 0; i < (size_t)OUT * IN; i++) {
+            r = r * 1103515245u + 12345u;
+            union { uint32_t u; float f; } v;
+            v.f = (float)((int)((r >> 16) & 0xffff) - 32768) * 1e-3f;
+            Wb[i] = (uint16_t)(v.u >> 16);
+        }
+        /* Scales VARY here, unlike the gate above. A constant 127 is exactly
+         * 1.0, so the whole per-block scale multiply cancels -- and the fold is
+         * precisely what the batched kernels rearranged. */
+        for (size_t i = 0; i < sizeof S8; i++) {
+            r = r * 1103515245u + 12345u;
+            S8[i] = (uint8_t)(120u + ((r >> 16) % 15u));
+        }
+        for (size_t i = 0; i < sizeof S4; i++) {
+            r = r * 1103515245u + 12345u;
+            S4[i] = (uint8_t)(120u + ((r >> 16) % 15u));
+        }
+
+        const struct { const char *name; DSV4QMat m; } cases[3] = {
+            { "bf16", { Wb, NULL, DSV4_WBF16, OUT, IN, 0,   0   } },
+            { "fp8",  { W8, S8,   DSV4_WFP8,  OUT, IN, 128, 128 } },
+            { "fp4",  { W4, S4,   DSV4_WFP4,  OUT, IN, 1,   32  } },
+        };
+
+        for (int ci = 0; ci < 3; ci++) {
+            const DSV4QMat *m = &cases[ci].m;
+            memset(ybatch, 0, sizeof ybatch);
+            dsv4_mmq_n(ybatch, xb, m, NT);
+
+            int bad = 0;
+            for (int t = 0; t < NT && !bad; t++) {
+                dsv4_mmq(yone, xb + (size_t)t * IN, m);
+                if (memcmp(yone, ybatch + (size_t)t * OUT,
+                           (size_t)OUT * sizeof(float)) != 0) {
+                    /* Name the first differing row: "they differ" is not
+                     * actionable, "row 12 of token 3" is. */
+                    int at = 0;
+                    for (int o = 0; o < OUT; o++)
+                        if (yone[o] != ybatch[(size_t)t * OUT + o]) { at = o; break; }
+                    CHECK(0, "%s batch token %d row %d: gemv %.17g, gemm %.17g",
+                          cases[ci].name, t, at, (double)yone[at],
+                          (double)ybatch[(size_t)t * OUT + at]);
+                    bad = 1;
+                }
+            }
+            if (!bad)
+                printf("  ok    %-4s %d tokens x %dx%d identical to %d GEMVs\n",
+                       cases[ci].name, NT, OUT, IN, NT);
+        }
+
+        /* nt == 1 must land on the GEMV itself, not on a batched kernel that
+         * happens to agree. The decode path is every token after the prompt and
+         * it is the path the whole-model oracle gates. */
+        {
+            const DSV4QMat *m = &cases[1].m;
+            dsv4_mmq(yone, xb, m);
+            memset(ybatch, 0, sizeof ybatch);
+            dsv4_mmq_n(ybatch, xb, m, 1);
+            CHECK(memcmp(yone, ybatch, (size_t)OUT * sizeof(float)) == 0,
+                  "nt == 1 does not match the GEMV");
+        }
+    }
 
     if (fails) { printf("MATMUL GATE FAILED: %d check(s)\n", fails); return 1; }
     printf("MATMUL GATE PASSED\n");
