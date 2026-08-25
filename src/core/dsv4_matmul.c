@@ -553,11 +553,12 @@ void dsv4_mmq(float *y, const float *x, const DSV4QMat *m)
  * accidentally start running through a different code path than the one the
  * whole-model oracle gates.
  *
- * NO GPU BRANCH, deliberately. dsv4_cuda_mmq uploads one activation vector and
- * returns one result vector; a batched device path is a separate piece of work
- * with its own gate, and silently falling back to nt GEMV calls on the device
- * would give up exactly the reuse this function exists to get. Prefill runs on
- * the CPU until that is built. */
+ * THE GPU BRANCH IS HERE NOW. It used to be absent deliberately, on the grounds
+ * that a batched device path was separate work -- but the consequence was that
+ * turning on --batch silently moved every resident FP8 matmul off the device
+ * and back onto the CPU, so the two flags the engine ships with fought each
+ * other. k_mmq_fp8_n makes one pass over the weights serve the whole batch,
+ * which is the same reuse this function exists to get on the CPU. */
 void dsv4_mmq_n(float *y, const float *x, const DSV4QMat *m, int nt)
 {
     if (nt <= 1) { dsv4_mmq(y, x, m); return; }
@@ -566,6 +567,9 @@ void dsv4_mmq_n(float *y, const float *x, const DSV4QMat *m, int nt)
                 nt, DSV4_MAX_BATCH);
         abort();
     }
+    /* Same contract as dsv4_mmq: residency decides, and only FP8 is ever
+     * resident. Everything else falls through to the CPU kernels below. */
+    if (dsv4_cuda_has(m)) { dsv4_cuda_mmq_n(y, x, m, nt); return; }
 
     switch (m->wdt) {
     case DSV4_WBF16:

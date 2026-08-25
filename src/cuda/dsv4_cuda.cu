@@ -128,6 +128,107 @@ __global__ void k_mmq_fp8(float *__restrict__ y,
     }
 }
 
+/* Elements of one scale block a single lane owns, and so the size of the
+ * decoded-weight register cache in k_mmq_fp8_n. blk_c is 128 on both released
+ * checkpoints, which puts the real value at 4; 8 leaves headroom without
+ * spending registers that matter. A wider block than 32*this falls back to
+ * decoding inline, so the kernel stays correct either way. */
+#define DSV4_CU_MAXSLICE 8
+
+/* Batched FP8: nt activation vectors against ONE resident weight matrix.
+ *
+ * WHY IT EXISTS. Prefill runs nt prompt tokens through the same weights, and
+ * until now dsv4_mmq_n had no device branch at all -- so turning on --batch
+ * silently moved every FP8 matmul from the GPU back to the CPU. That was
+ * documented as deliberate ("a batched device path is a separate piece of
+ * work"), and this is that work.
+ *
+ * THE LOOP ORDER IS THE POINT, exactly as on the CPU. One block owns one output
+ * row, walks that row's weights once, and serves every token from the bytes it
+ * has in hand. The single-token kernel re-reads the whole 33.5 MB matrix per
+ * token; this reads it once per batch. The token loop sits INSIDE the scale
+ * block so the 128 weight bytes stay in L1 across all nt of them.
+ *
+ * PER (ROW, TOKEN) THE REDUCTION IS IDENTICAL TO k_mmq_fp8 -- same warp
+ * striding, same 32-lane shuffle fold, same float-inside-block/double-above
+ * split. So nt == 1 through here is bit-identical to the single-token kernel,
+ * and the gate in tests/unit/test_cuda.c checks precisely that rather than
+ * trusting the claim. What batching changes is which dot products are in
+ * flight, not how any one of them is summed.
+ *
+ * y is [nt][rows], matching the CPU batched kernels.
+ */
+__global__ void k_mmq_fp8_n(float *__restrict__ y,
+                            const float *__restrict__ x,
+                            const unsigned char *__restrict__ W,
+                            const unsigned char *__restrict__ S,
+                            int in, int blk_r, int blk_c, int sc, int nt)
+{
+    const int o = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarp = blockDim.x >> 5;
+
+    const unsigned char *row = W + (size_t)o * in;
+
+    /* [nwarp][nt] partials. Only lane 0 of each warp ever touches its slice, so
+     * the init below needs no barrier against the accumulation that follows. */
+    extern __shared__ double part_n[];
+    double *mine = part_n + (size_t)warp * nt;
+    if (lane == 0)
+        for (int t = 0; t < nt; t++) mine[t] = 0.0;
+
+    for (int c0 = warp * blk_c; c0 < in; c0 += nwarp * blk_c) {
+        const int n = min(blk_c, in - c0);
+        /* Hoisted out of the token loop: one conversion instead of nt of them,
+         * of the same value. Not a reassociation. */
+        const double s = (double)d_e8m0(S[(size_t)(o / blk_r) * sc
+                                        + (c0 / blk_c)]);
+
+        /* DECODE THIS LANE'S SLICE ONCE, then let every token spend it.
+         *
+         * The first version of this kernel called d_e4m3 inside the token loop
+         * and was compute-bound because of it: 8 tokens took 2.92 ms against
+         * 4.00 ms for 8 separate single-vector calls, only 1.37x, when the
+         * weight traffic had already fallen 8x. The decode, not the DRAM read,
+         * was the cost. A lane owns at most blk_c/32 elements of a scale block
+         * -- 4 at the shipped blk_c of 128 -- so they sit in registers.
+         *
+         * Bit-exactness is untouched: the same value is computed once instead
+         * of nt times and the fmaf order per (row, token) does not move. */
+        float wv[DSV4_CU_MAXSLICE];
+        int nv = 0;
+        const int slice = (n - lane + 31) / 32;
+        if (slice <= DSV4_CU_MAXSLICE)
+            for (int k = lane; k < n; k += 32) wv[nv++] = d_e4m3(row[c0 + k]);
+
+        for (int t = 0; t < nt; t++) {
+            const float *xt = x + (size_t)t * in;
+            float acc = 0.0f;
+            if (slice <= DSV4_CU_MAXSLICE) {
+                int j = 0;
+                for (int k = lane; k < n; k += 32)
+                    acc = fmaf(wv[j++], xt[c0 + k], acc);
+            } else {
+                /* Only reachable if a future checkpoint ships a scale block
+                 * wider than 32*DSV4_CU_MAXSLICE. Same arithmetic, no cache. */
+                for (int k = lane; k < n; k += 32)
+                    acc = fmaf(d_e4m3(row[c0 + k]), xt[c0 + k], acc);
+            }
+            for (int off = 16; off > 0; off >>= 1)
+                acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+            if (lane == 0) mine[t] += (double)acc * s;
+        }
+    }
+
+    __syncthreads();
+    for (int t = threadIdx.x; t < nt; t += blockDim.x) {
+        double total = 0.0;
+        for (int w = 0; w < nwarp; w++) total += part_n[(size_t)w * nt + t];
+        y[(size_t)t * gridDim.x + o] = (float)total;
+    }
+}
+
 /* ------------------------------------------------------------- residency ---
  * Matrices are keyed by their host weight pointer. That is sound here because
  * the trunk pins each layer once for the life of the run, so the pointer is
@@ -299,6 +400,37 @@ extern "C" void dsv4_cuda_mmq(float *y, const float *x, const DSV4QMat *m)
     cudaMemcpy(g_hy, g_y, (size_t)r->rows * sizeof(float),
                cudaMemcpyDeviceToHost);
     memcpy(y, g_hy, (size_t)r->rows * sizeof(float));
+}
+
+/* nt activations in, nt results out, one weight pass on the device.
+ *
+ * Staging grows to nt*cols in and nt*rows out; both still cross PCIe as pinned
+ * copies for the reason in stage(), and both are tiny next to the weight matrix
+ * that no longer crosses at all -- 4096 floats per token against 33.5 MB. */
+extern "C" void dsv4_cuda_mmq_n(float *y, const float *x, const DSV4QMat *m,
+                                int nt)
+{
+    if (nt <= 1) { dsv4_cuda_mmq(y, x, m); return; }
+
+    Res *r = find(m->w);
+    if (!r || nt > DSV4_MAX_BATCH ||
+        stage(nt * r->cols, nt * r->rows) != 0) {
+        fprintf(stderr, "dsv4_cuda: mmq_n called for a matrix that is not "
+                        "resident, or a batch that will not stage\n");
+        abort();
+    }
+
+    const size_t xn = (size_t)nt * r->cols, yn = (size_t)nt * r->rows;
+    const int threads = 128;
+    const size_t shmem = (size_t)(threads / 32) * (size_t)nt * sizeof(double);
+
+    memcpy(g_hx, x, xn * sizeof(float));
+    cudaMemcpy(g_x, g_hx, xn * sizeof(float), cudaMemcpyHostToDevice);
+    k_mmq_fp8_n<<<r->rows, threads, shmem>>>(g_y, g_x, r->dw, r->ds,
+                                             r->cols, r->blk_r, r->blk_c,
+                                             r->sc, nt);
+    cudaMemcpy(g_hy, g_y, yn * sizeof(float), cudaMemcpyDeviceToHost);
+    memcpy(y, g_hy, yn * sizeof(float));
 }
 
 extern "C" void dsv4_cuda_shutdown(void)

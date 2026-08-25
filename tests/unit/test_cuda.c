@@ -22,6 +22,14 @@
  *             nothing about whether the kernel is right.
  *
  *     GATE 3  argmax identity, which is what actually decides a token.
+ *
+ *     GATE 4  the BATCHED device path, and this one IS bit equality again --
+ *             against nt separate single-vector device calls, not against the
+ *             CPU. It can be exact because batching changes which dot products
+ *             are in flight, not how any one of them is summed: k_mmq_fp8_n
+ *             keeps the same warp striding, shuffle fold and accumulation split
+ *             as k_mmq_fp8. Anything looser would hide a token reading another
+ *             token's activations, which is the likeliest way to get it wrong.
  */
 #include <math.h>
 #include <stdio.h>
@@ -182,6 +190,71 @@ int main(void)
             if (worst < 1e-5 && ac == ag)
                 printf("  ok    %dx%d agrees to %.2g relative, argmax %d both\n",
                        out, in, worst, ac);
+
+            /* ---- GATE 4  the BATCHED device path ----
+             *
+             * Terms are stricter here than gates 2 and 3, and can be: batching
+             * changes which dot products are in flight, not how any one of them
+             * is summed. k_mmq_fp8_n keeps the same warp striding, the same
+             * 32-lane shuffle fold and the same float-inside-block/double-above
+             * split as k_mmq_fp8, so per (row, token) the reduction order is
+             * IDENTICAL. That makes bit equality against nt separate
+             * single-vector device calls the right check -- a loose tolerance
+             * here would hide exactly the bugs this kernel can have: a token
+             * reading another token's activations, a scale hoisted to the wrong
+             * place, or a shared-memory partial folded across the wrong warp.
+             *
+             * Activations DIFFER per token on purpose. Feeding one vector nt
+             * times would pass even if the kernel ignored the token index
+             * entirely, which is the most likely way to get this wrong. */
+            {
+                const int NT = 8;
+                float *xn = malloc((size_t)NT * in * sizeof(float));
+                float *yn = malloc((size_t)NT * out * sizeof(float));
+                float *y1 = malloc((size_t)out * sizeof(float));
+                int bad = -1, badt = -1;
+
+                for (int t = 0; t < NT; t++)
+                    for (int i = 0; i < in; i++)
+                        xn[(size_t)t * in + i] =
+                            (float)sin(0.7 * (i + 1) + 3.1 * (t + 1));
+
+                dsv4_cuda_mmq_n(yn, xn, &m, NT);
+
+                for (int t = 0; t < NT && bad < 0; t++) {
+                    dsv4_cuda_mmq(y1, xn + (size_t)t * in, &m);
+                    for (int i = 0; i < out; i++)
+                        if (yn[(size_t)t * out + i] != y1[i]) {
+                            bad = i; badt = t; break;
+                        }
+                }
+                CHECK(bad < 0, "batched token %d row %d is %.17g, single-vector "
+                      "device call says %.17g", badt, bad,
+                      bad < 0 ? 0.0 : (double)yn[(size_t)badt * out + bad],
+                      bad < 0 ? 0.0 : (double)y1[bad]);
+
+                /* nt == 1 must land on the single-vector kernel itself. */
+                dsv4_cuda_mmq_n(yn, xn, &m, 1);
+                dsv4_cuda_mmq(y1, xn, &m);
+                int one = 0;
+                for (int i = 0; i < out; i++) if (yn[i] != y1[i]) { one = 1; break; }
+                CHECK(!one, "mmq_n at nt == 1 does not match mmq");
+
+                if (bad < 0 && !one) {
+                    double t1 = now();
+                    dsv4_cuda_mmq_n(yn, xn, &m, NT);
+                    const double tn = now() - t1;
+                    t1 = now();
+                    for (int t = 0; t < NT; t++)
+                        dsv4_cuda_mmq(y1, xn + (size_t)t * in, &m);
+                    const double t1x = now() - t1;
+                    printf("  ok    batched %d tokens bit-identical to %d single "
+                           "calls, %.2fx (%.2f vs %.2f ms)\n",
+                           NT, NT, t1x / tn, tn * 1e3, t1x * 1e3);
+                }
+                free(xn); free(yn); free(y1);
+            }
+
         }
         free(W); free(S); free(x); free(yc); free(yg);
     }

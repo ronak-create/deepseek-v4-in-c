@@ -87,6 +87,12 @@ int dsv4_cuda_has(const DSV4QMat *m);
  * 33.5 MB weight read that no longer crosses the bus at all. */
 void dsv4_cuda_mmq(float *y, const float *x, const DSV4QMat *m);
 
+/* y = m * x for nt activation vectors, y and x both [nt][.]. Only valid when
+ * dsv4_cuda_has(m). One pass over the weights serves the whole batch, which is
+ * the entire reason this exists: the single-vector call re-reads the matrix per
+ * token. nt == 1 forwards to dsv4_cuda_mmq and is bit-identical to it. */
+void dsv4_cuda_mmq_n(float *y, const float *x, const DSV4QMat *m, int nt);
+
 /* Bytes of VRAM still free, for the budget planner. */
 size_t dsv4_cuda_free_vram(void);
 
