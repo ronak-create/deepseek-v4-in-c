@@ -139,4 +139,57 @@ void dsv4_layer_forward(float *h, const DSV4LayerW *w, const DSV4Cfg *c,
                         DSV4LayerState *st, const float *cs, const float *sn,
                         int pos, int token_id);
 
+/* ------------------------------------------------------- batched prefill ---
+ * Prompt tokens do not have to go through one at a time: their inputs are
+ * already known, which is what makes them prompt tokens. Running nt of them
+ * together lets one loaded weight serve all nt, taking the matmuls from GEMV
+ * (bound by how fast weights arrive) to GEMM (bound by arithmetic).
+ *
+ * dsv4_layer_forward_n is the same layer as dsv4_layer_forward and must produce
+ * the same numbers to the bit. It batches the MoE half -- router, expert union,
+ * and the shared expert -- and still walks the attention half one token at a
+ * time, because that half has position-ordered state (the sliding ring, the
+ * compressor's accumulator, how many compressed rows a token may see) and MoE
+ * has none.
+ *
+ * h is [nt][hc_mult * hidden], token_ids is [nt], and the tokens occupy
+ * absolute positions pos0 .. pos0+nt-1. Passing them out of position order, or
+ * with a gap, is a caller bug this cannot detect.
+ */
+/* Scratch that has to exist once per token in the batch. Deliberately NOT a
+ * DSV4Scratch per token: most of that struct (attn_scratch, expert_gate/up/out,
+ * idx_scores) is only live inside a sequential phase and one copy serves the
+ * whole batch. attn_scratch alone is 1.2 MB on Flash; 64 of them would be 75 MB
+ * of arena to hold values that are dead by the next token. */
+typedef struct {
+    int cap, hidden, hc, topk, n_experts;
+    float *x1;          /* [cap][hidden]            normed block input       */
+    float *resid;       /* [cap][hc*hidden]         residual for hc_post     */
+    float *post;        /* [cap][hc]                hc_pre output            */
+    float *comb;        /* [cap][hc*hc]             hc_pre output            */
+    float *blk_out;     /* [cap][hidden]            attention / moe output   */
+    float *gate_scores; /* [cap][n_experts]                                  */
+    float *gate_orig;   /* [cap][n_experts]                                  */
+    int   *topk_idx;    /* [cap][topk]                                       */
+    float *topk_w;      /* [cap][topk]                                       */
+    float *expert_acc;  /* [cap][topk][hidden]      k-ordered, see above     */
+    float *xsub;        /* [cap][hidden]            one expert's token gather*/
+    float *asub;        /* [cap][hidden]            that expert's outputs    */
+    float *e_gate;      /* [cap][moe_inter]         batched expert_forward   */
+    float *e_up;        /* [cap][moe_inter]                                  */
+    float *e_out;       /* [cap][moe_inter]                                  */
+    int   *sub_t;       /* [cap]                    which token each row is  */
+    int   *sub_k;       /* [cap]                    which k that row serves  */
+    void  *arena;
+} DSV4Batch;
+
+int  dsv4_batch_init(DSV4Batch *b, const DSV4Cfg *c, int cap);
+void dsv4_batch_free(DSV4Batch *b);
+
+void dsv4_layer_forward_n(float *h, const DSV4LayerW *w, const DSV4Cfg *c,
+                          DSV4Scratch *s, DSV4Batch *b,
+                          const DSV4ExpertSrc *src, DSV4LayerState *st,
+                          const float *cs, const float *sn,
+                          int pos0, const int32_t *token_ids, int nt);
+
 #endif /* DSV4_LAYER_H */

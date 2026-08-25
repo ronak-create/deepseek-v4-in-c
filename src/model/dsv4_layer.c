@@ -53,6 +53,7 @@ void dsv4_swiglu(float *, const float *, const float *, int, float);
 void dsv4_route(int *, float *, float *, float *, const float *,
                 const int64_t *, int, int, int, float);
 void dsv4_mmq(float *, const float *, const DSV4QMat *);
+void dsv4_mmq_n(float *, const float *, const DSV4QMat *, int);
 void dsv4_rope_apply(float *, int, int, const float *, const float *, int, int, int);
 void dsv4_sparse_attn(float *, const float *, const float *, const float *,
                       const int *, int, int, int, float, float *);
@@ -518,5 +519,400 @@ void dsv4_layer_forward(float *h, const DSV4LayerW *w, const DSV4Cfg *c,
 
     t0 = pnow();
     dsv4_hc_post(h, s->qr, s->resid, s->post, s->comb, hc, d);
+    dsv4_prof.hc += pnow() - t0;
+}
+
+/* ============================================================== BATCHED ====
+ * The prefill path: nt prompt tokens through one layer together.
+ *
+ * WHY THIS EXISTS
+ *   A prompt token costs about as much as a generated one, so time-to-first-
+ *   token is ~1 s per prompt token: 3.5 minutes on a 207-token prompt. For
+ *   agent loops and code completion that, not the decode rate, is the blocker.
+ *
+ *   Nothing about a prompt token requires it to be processed alone. Its input
+ *   is already known -- that is what makes it a prompt token. So the weights
+ *   can be loaded once and used for all of them, which is the difference
+ *   between a GEMV bound by how fast weights arrive and a GEMM bound by
+ *   arithmetic. bench/gemm_bw.c prices that at 1.4-3.2x depending on shape.
+ *
+ * WHAT IS BATCHED HERE AND WHAT IS NOT
+ *   The MoE half is batched: the router runs as one GEMM, the batch's expert
+ *   requests are unioned so each distinct expert is READ FROM DISK ONCE for the
+ *   whole batch instead of once per token, and every token routed to an expert
+ *   goes through it as one GEMM.
+ *
+ *   The attention half still runs one token at a time inside the batch. Not an
+ *   oversight: attention is the only part with a position-ordered dependency
+ *   chain -- the sliding ring, the HCA compressor's accumulator, and how many
+ *   compressed rows each token is allowed to see all advance per token. MoE has
+ *   no such state, which is exactly why it is the half done first. Batching the
+ *   attention projections is a separate change with its own risks.
+ *
+ * WHY IT STAYS BIT-EXACT
+ *   Two rules, and they are the whole argument.
+ *
+ *   1. Every dot product is computed by the same kernel over the same columns
+ *      in the same order as the per-token path -- see the note above
+ *      GEN_MATMULS_N in dsv4_matmul.c. Batching changes WHEN independent dot
+ *      products are issued, not how any one of them is summed.
+ *
+ *   2. The weighted expert sum stays in k order PER TOKEN. That is why
+ *      expert_acc is [nt][topk][hidden] rather than an accumulator that experts
+ *      add into as they are processed. Iterating expert-major and accumulating
+ *      as you go is the obvious implementation, it is faster still, and it
+ *      would silently produce a different model -- float addition is not
+ *      associative and the union is not in k order for any token.
+ */
+
+
+void dsv4_batch_free(DSV4Batch *b)
+{
+    if (!b) return;
+    free(b->arena);
+    free(b->topk_idx);
+    free(b->sub_t);
+    free(b->sub_k);
+    memset(b, 0, sizeof *b);
+}
+
+int dsv4_batch_init(DSV4Batch *b, const DSV4Cfg *c, int cap)
+{
+    memset(b, 0, sizeof *b);
+    if (cap < 1 || cap > DSV4_MAX_BATCH) {
+        fprintf(stderr, "dsv4_batch_init: cap %d outside 1..%d\n",
+                cap, DSV4_MAX_BATCH);
+        return -1;
+    }
+    b->cap = cap;
+    b->hidden = c->hidden;
+    b->hc = c->hc_mult;
+    b->topk = c->topk;
+    b->n_experts = c->n_experts;
+
+    const size_t n   = (size_t)cap;
+    const size_t d   = (size_t)c->hidden;
+    const size_t hc  = (size_t)c->hc_mult;
+    const size_t ne  = (size_t)c->n_experts;
+    const size_t tk  = (size_t)c->topk;
+    /* Widest user of the expert scratch is the SHARED expert, whose inter is
+     * moe_inter * n_shared. Sizing these to moe_inter alone is correct only
+     * while n_shared == 1, which is true of Flash and is exactly the kind of
+     * assumption this engine has been bitten by before. */
+    const size_t itr = (size_t)c->moe_inter
+                     * (size_t)(c->n_shared > 1 ? c->n_shared : 1);
+
+    const size_t nf = n * d            /* x1          */
+                    + n * hc * d       /* resid       */
+                    + n * hc           /* post        */
+                    + n * hc * hc      /* comb        */
+                    + n * d            /* blk_out     */
+                    + n * ne           /* gate_scores */
+                    + n * ne           /* gate_orig   */
+                    + n * tk           /* topk_w      */
+                    + n * tk * d       /* expert_acc  */
+                    + n * d            /* xsub        */
+                    + n * d            /* asub        */
+                    + n * itr * 3;     /* e_gate/up/out */
+
+    float *a = (float *)calloc(nf, sizeof(float));
+    if (!a) {
+        fprintf(stderr, "dsv4_batch_init: could not allocate %.1f MB for a "
+                        "%d-token batch\n",
+                (double)(nf * sizeof(float)) / 1048576.0, cap);
+        return -1;
+    }
+    b->arena = a;
+
+    float *p = a;
+    b->x1 = p;          p += n * d;
+    b->resid = p;       p += n * hc * d;
+    b->post = p;        p += n * hc;
+    b->comb = p;        p += n * hc * hc;
+    b->blk_out = p;     p += n * d;
+    b->gate_scores = p; p += n * ne;
+    b->gate_orig = p;   p += n * ne;
+    b->topk_w = p;      p += n * tk;
+    b->expert_acc = p;  p += n * tk * d;
+    b->xsub = p;        p += n * d;
+    b->asub = p;        p += n * d;
+    b->e_gate = p;      p += n * itr;
+    b->e_up = p;        p += n * itr;
+    b->e_out = p;       p += n * itr;
+
+    b->topk_idx = (int *)calloc(n * tk, sizeof(int));
+    b->sub_t    = (int *)calloc(n, sizeof(int));
+    b->sub_k    = (int *)calloc(n, sizeof(int));
+    if (!b->topk_idx || !b->sub_t || !b->sub_k) {
+        dsv4_batch_free(b);
+        return -1;
+    }
+    return 0;
+}
+
+/* SwiGLU expert over a batch of rows. Same three matmuls and the same
+ * activation as expert_forward, with nsub rows instead of one. */
+static void expert_forward_n(float *out, const float *x, const DSV4ExpertW *e,
+                             DSV4Batch *b, int hidden, int inter, float limit,
+                             int nsub)
+{
+    dsv4_mmq_n(b->e_gate, x, &e->w1, nsub);
+    dsv4_mmq_n(b->e_up,   x, &e->w3, nsub);
+    for (int r = 0; r < nsub; r++)
+        dsv4_swiglu(b->e_out + (size_t)r * inter,
+                    b->e_gate + (size_t)r * inter,
+                    b->e_up   + (size_t)r * inter, inter, limit);
+    dsv4_mmq_n(out, b->e_out, &e->w2, nsub);
+    (void)hidden;
+}
+
+/* One expert, over every row of the batch routed to it.
+ *
+ * Gathers the (token, k) pairs that asked for expert `eid`, runs them through
+ * it as a single GEMM, and scatters the results back into the k-ordered
+ * accumulator. A token can appear at most once, because top-k yields distinct
+ * experts -- but WHICH k it came from has to be carried along, since that is
+ * what the weighted sum is ordered by.
+ *
+ * Factored out because it is now called from two places: once for the experts
+ * that were already resident when begin() returned, and again for the ones the
+ * drive still owed at end(). */
+static void run_expert_n(const DSV4ExpertW *ew, int eid, const float *x,
+                         const DSV4Cfg *c, DSV4Batch *b, int nt)
+{
+    const int d = c->hidden, tk = c->topk;
+    int nsub = 0;
+
+    for (int t = 0; t < nt; t++)
+        for (int k = 0; k < tk; k++)
+            if (b->topk_idx[(size_t)t * tk + k] == eid) {
+                memcpy(b->xsub + (size_t)nsub * d,
+                       x + (size_t)t * d, (size_t)d * sizeof(float));
+                b->sub_t[nsub] = t;
+                b->sub_k[nsub] = k;
+                nsub++;
+            }
+    if (nsub == 0) return;
+
+    expert_forward_n(b->asub, b->xsub, ew, b, d, c->moe_inter,
+                     c->swiglu_limit, nsub);
+
+    for (int r = 0; r < nsub; r++)
+        memcpy(b->expert_acc
+                 + (((size_t)b->sub_t[r] * tk) + b->sub_k[r]) * d,
+               b->asub + (size_t)r * d, (size_t)d * sizeof(float));
+}
+
+/* The MoE half for a whole batch.
+ *
+ * THE UNION IS THE POINT. nt tokens ask for nt*topk experts, but they overlap:
+ * measured on real route logs, 32 prompt tokens ask for 192 experts that are
+ * 65 distinct ones. Each distinct expert is fetched ONCE -- one 12.75 MB read
+ * instead of one per token that wanted it -- and then every token routed to it
+ * goes through it as a single GEMM.
+ */
+static void moe_n(float *out, const float *x, const DSV4LayerW *w,
+                  const DSV4Cfg *c, DSV4Scratch *s, DSV4Batch *b,
+                  const DSV4ExpertSrc *src, int layer,
+                  const int32_t *token_ids, int nt)
+{
+    const int d = c->hidden, tk = c->topk, ne = c->n_experts;
+
+    double t0 = pnow();
+    dsv4_mmq_n(b->gate_scores, x, &w->moe.gate, nt);
+    for (int t = 0; t < nt; t++)
+        dsv4_route(b->topk_idx + (size_t)t * tk, b->topk_w + (size_t)t * tk,
+                   b->gate_scores + (size_t)t * ne,
+                   b->gate_orig + (size_t)t * ne,
+                   w->moe.bias, w->moe.tid2eid, token_ids[t],
+                   ne, tk, c->routed_scale);
+    dsv4_prof.gate += pnow() - t0;
+
+    /* The distinct experts this batch needs, in first-request order. A linear
+     * scan: the list is at most nt*topk long and the comparison is an int, so a
+     * hash set would cost more to build than it saves. */
+    int uniq[DSV4_MAX_BATCH * DSV4_MAX_TOPK];
+    int nuniq = 0;
+    for (int t = 0; t < nt; t++)
+        for (int k = 0; k < tk; k++) {
+            const int e = b->topk_idx[(size_t)t * tk + k];
+            int seen = 0;
+            for (int u = 0; u < nuniq; u++) if (uniq[u] == e) { seen = 1; break; }
+            if (!seen) uniq[nuniq++] = e;
+        }
+
+    /* Fetched in chunks the cache can hold at once, so the reads inside a chunk
+     * still go out concurrently. A whole union can be hundreds of experts and
+     * several gigabytes; asking for it in one call would demand a cache big
+     * enough to pin all of it.
+     *
+     * AND THE READS OVERLAP THE MATMULS, for the same reason the per-token path
+     * does it -- see the long note in moe(). The first version of this function
+     * called get_many() and then computed, which is the hard barrier that
+     * commit c0b19aa removed from the per-token path; batching silently put it
+     * back. Measured on a 53-token prompt at --budget 16, CPU only: exposed
+     * expert I/O went from 10.0 s per run on the per-token path to 15.1 s
+     * batched, +49%, while the batch was reading 21% FEWER bytes. That
+     * regression ate most of what the GEMMs won.
+     *
+     * The bit-exactness argument is unchanged and does not depend on the
+     * overlap: every (token, k) pair has its own slot in expert_acc, so no two
+     * experts share an output buffer and completion order cannot reach the
+     * arithmetic. The weighted sum still runs afterwards, strictly in k order
+     * per token. run_expert_n's own scratch (xsub/asub/e_gate/e_up/e_out) IS
+     * shared, which is why the calls stay sequential with respect to each
+     * other; only the reads run concurrently with them. */
+    const int overlapped = (src->begin && src->end);
+
+    for (int u0 = 0; u0 < nuniq; u0 += DSV4_MAX_TOPK) {
+        const int nchunk = (nuniq - u0 < DSV4_MAX_TOPK) ? nuniq - u0
+                                                        : DSV4_MAX_TOPK;
+        const DSV4ExpertW *ex[DSV4_MAX_TOPK];
+        int done[DSV4_MAX_TOPK];
+        for (int j = 0; j < nchunk; j++) { ex[j] = NULL; done[j] = 0; }
+
+        t0 = pnow();
+        if (overlapped)
+            src->begin(src->ctx, layer, uniq + u0, nchunk, ex);
+        else if (src->get_many)
+            src->get_many(src->ctx, layer, uniq + u0, nchunk, ex);
+        else
+            for (int j = 0; j < nchunk; j++)
+                ex[j] = src->get(src->ctx, layer, uniq[u0 + j]);
+        dsv4_prof.expert_io += pnow() - t0;
+
+        if (overlapped) {
+            /* The residents, while the misses are still on the wire. */
+            t0 = pnow();
+            for (int j = 0; j < nchunk; j++) {
+                if (!ex[j]) continue;
+                run_expert_n(ex[j], uniq[u0 + j], x, c, b, nt);
+                done[j] = 1;
+            }
+            dsv4_prof.expert_mm += pnow() - t0;
+
+            /* Whatever the drive still owes. Counted as I/O because that is
+             * what it is: time blocked with nothing left to overlap. */
+            t0 = pnow();
+            src->end(src->ctx, ex);
+            dsv4_prof.expert_io += pnow() - t0;
+        }
+
+        t0 = pnow();
+        for (int j = 0; j < nchunk; j++) {
+            if (!ex[j]) {
+                /* Same contract as the per-token path: a token routed through
+                 * fewer experts than the model specifies is a different model,
+                 * producing fluent and wrong output. Not survivable. */
+                fprintf(stderr, "dsv4_layer: layer %d could not obtain routed "
+                                "expert %d; refusing to emit tokens routed "
+                                "through fewer experts than the model "
+                                "specifies\n", layer, uniq[u0 + j]);
+                abort();
+            }
+            if (!done[j])
+                run_expert_n(ex[j], uniq[u0 + j], x, c, b, nt);
+        }
+        dsv4_prof.expert_mm += pnow() - t0;
+    }
+
+    /* IN k ORDER, PER TOKEN. Rule 2 of the header comment. */
+    t0 = pnow();
+    for (int t = 0; t < nt; t++) {
+        float *o = out + (size_t)t * d;
+        for (int i = 0; i < d; i++) o[i] = 0.0f;
+        for (int k = 0; k < tk; k++) {
+            const float *acc = b->expert_acc
+                             + (((size_t)t * tk) + k) * d;
+            const float wk = b->topk_w[(size_t)t * tk + k];
+            for (int i = 0; i < d; i++) o[i] += wk * acc[i];
+        }
+    }
+    dsv4_prof.expert_mm += pnow() - t0;
+
+    /* The shared expert is added UNWEIGHTED, after the routed sum -- and it is
+     * resident, so it batches N-wide with no fetch at all. */
+    t0 = pnow();
+    {
+        const int inter = c->moe_inter * c->n_shared;
+        dsv4_mmq_n(b->e_gate, x, &w->moe.shared.w1, nt);
+        dsv4_mmq_n(b->e_up,   x, &w->moe.shared.w3, nt);
+        for (int t = 0; t < nt; t++)
+            dsv4_swiglu(b->e_out + (size_t)t * inter,
+                        b->e_gate + (size_t)t * inter,
+                        b->e_up   + (size_t)t * inter, inter, c->swiglu_limit);
+        dsv4_mmq_n(b->xsub, b->e_out, &w->moe.shared.w2, nt);
+        for (int t = 0; t < nt; t++) {
+            float *o = out + (size_t)t * d;
+            const float *sh = b->xsub + (size_t)t * d;
+            for (int i = 0; i < d; i++) o[i] += sh[i];
+        }
+    }
+    dsv4_prof.shared += pnow() - t0;
+    (void)s;
+}
+
+/* One layer over nt tokens whose absolute positions are pos0..pos0+nt-1. */
+void dsv4_layer_forward_n(float *h, const DSV4LayerW *w, const DSV4Cfg *c,
+                          DSV4Scratch *s, DSV4Batch *b,
+                          const DSV4ExpertSrc *src, DSV4LayerState *st,
+                          const float *cs, const float *sn,
+                          int pos0, const int32_t *token_ids, int nt)
+{
+    const int hc = c->hc_mult, d = c->hidden;
+    const size_t wide = (size_t)hc * d;
+
+    /* ---- attention half, STRICTLY IN POSITION ORDER ----
+     *
+     * Token t must see the sliding ring and the compressor exactly as it stood
+     * at position pos0+t. Running the batch's KV writes ahead of its reads
+     * would be wrong in two ways at once: a token would attend to positions
+     * after its own, and once the ring wraps, token t+1's write lands on the
+     * very slot holding the oldest position token t still needs. */
+    for (int t = 0; t < nt; t++) {
+        float *ht = h + (size_t)t * wide;
+        double t0 = pnow();
+        memcpy(b->resid + (size_t)t * wide, ht, wide * sizeof(float));
+        dsv4_hc_pre(b->x1 + (size_t)t * d, b->post + (size_t)t * hc,
+                    b->comb + (size_t)t * hc * hc, s->mixes, ht, &w->hc_attn,
+                    hc, d, c->hc_sinkhorn_iters, c->rms_eps, c->hc_eps);
+        dsv4_rmsnorm(b->x1 + (size_t)t * d, b->x1 + (size_t)t * d,
+                     w->attn_norm, d, c->rms_eps);
+        double t1 = pnow();
+        dsv4_prof.hc += t1 - t0;
+
+        const int n_idx = dsv4_window_idxs(s->idxs, pos0 + t, c->sliding_window);
+        attention(s->qr, b->x1 + (size_t)t * d, w, c, s, st, cs, sn,
+                  pos0 + t, n_idx);
+        t0 = pnow();
+        dsv4_prof.attn += t0 - t1;
+
+        dsv4_hc_post(ht, s->qr, b->resid + (size_t)t * wide,
+                     b->post + (size_t)t * hc,
+                     b->comb + (size_t)t * hc * hc, hc, d);
+        dsv4_prof.hc += pnow() - t0;
+    }
+
+    /* ---- FFN half, batched. The residual is taken HERE, not at the top. ---- */
+    double t0 = pnow();
+    for (int t = 0; t < nt; t++) {
+        float *ht = h + (size_t)t * wide;
+        memcpy(b->resid + (size_t)t * wide, ht, wide * sizeof(float));
+        dsv4_hc_pre(b->x1 + (size_t)t * d, b->post + (size_t)t * hc,
+                    b->comb + (size_t)t * hc * hc, s->mixes, ht, &w->hc_ffn,
+                    hc, d, c->hc_sinkhorn_iters, c->rms_eps, c->hc_eps);
+        dsv4_rmsnorm(b->x1 + (size_t)t * d, b->x1 + (size_t)t * d,
+                     w->ffn_norm, d, c->rms_eps);
+    }
+    dsv4_prof.hc += pnow() - t0;
+
+    moe_n(b->blk_out, b->x1, w, c, s, b, src, w->layer, token_ids, nt);
+
+    t0 = pnow();
+    for (int t = 0; t < nt; t++)
+        dsv4_hc_post(h + (size_t)t * wide, b->blk_out + (size_t)t * d,
+                     b->resid + (size_t)t * wide,
+                     b->post + (size_t)t * hc,
+                     b->comb + (size_t)t * hc * hc, hc, d);
     dsv4_prof.hc += pnow() - t0;
 }

@@ -60,6 +60,28 @@ static const DSV4ExpertW *ge(void *ctx, int L, int e)
     (void)ctx; return dsv4_cache_get(g_cache, L, e);
 }
 
+/* The overlapped pair, wired in so this gate actually covers it.
+ *
+ * It did not, before: the source here was built with .get alone, so both the
+ * per-token path and the batched one took their non-overlapped branch and the
+ * bit-exactness claim was never checked against the code that really runs. The
+ * engine has been bitten by exactly that shape of gap before -- a gate that
+ * cannot reach the path it claims to protect. */
+static DSV4CacheBatch g_obatch;
+
+static int ge_begin(void *ctx, int L, const int *e, int n,
+                    const DSV4ExpertW **out)
+{
+    (void)ctx;
+    return dsv4_cache_get_many_begin(g_cache, L, e, n, out, &g_obatch);
+}
+
+static int ge_end(void *ctx, const DSV4ExpertW **out)
+{
+    (void)ctx;
+    return dsv4_cache_get_many_end(g_cache, out, &g_obatch);
+}
+
 /* The head's hc reduction: a sigmoid gate, NO Sinkhorn and no comb matrix, and
  * a single scalar hc_scale where a block has three. Duplicated from the CLI on
  * purpose -- if the two ever diverge this gate keeps measuring the reference
@@ -182,12 +204,15 @@ int main(int argc, char **argv)
     /* Named, so adding a member to DSV4ExpertSrc cannot silently
      * shift what this gate is testing. get() only: these gates check
      * the arithmetic, and the fetch path has its own. */
-    DSV4ExpertSrc src = { .get = ge };
+    DSV4ExpertSrc src = { .get = ge, .begin = ge_begin, .end = ge_end };
 
     const int hc = c.hc_mult, d = c.hidden;
     float *h = calloc((size_t)hc * d, sizeof(float));
     float *y = calloc((size_t)d, sizeof(float));
     float *logits = calloc((size_t)c.vocab, sizeof(float));
+    /* Every position's logits, kept so the batched prefill below can be
+     * compared against the run that was just validated against torch. */
+    float *ref_logits = calloc((size_t)toks->len * c.vocab, sizeof(float));
 
     printf("\n-- %d positions through %d layers (%s) --\n",
            toks->len, c.n_layers, "config, safetensors, binder, trunk, cache, all real");
@@ -220,6 +245,8 @@ int main(int argc, char **argv)
         if (pos == 0 && !stage(trace, "norm", y, d)) goto done;
         DSV4QMat head = { mb.w.head, NULL, DSV4_WBF16, c.vocab, d, 0, 0 };
         dsv4_mmq(logits, y, &head);
+        memcpy(ref_logits + (size_t)pos * c.vocab, logits,
+               (size_t)c.vocab * sizeof(float));
 
         /* Compare against the reference, scaled by the vector rather than by
          * each element -- see test_oracle.c for why. */
@@ -255,9 +282,104 @@ int main(int argc, char **argv)
                    pos, c_arg, (double)worst, c.vocab);
     }
 
+    /* ---------------------------------------------------------------------
+     * BATCHED PREFILL, against the run that was just checked against torch.
+     *
+     * This is the gate for dsv4_layer_forward_n, and it is deliberately the
+     * strictest kind available: bit equality against the per-token path, on the
+     * real loader and the real tiny checkpoint, after the per-token path has
+     * itself been validated against a PyTorch reference. So "batched agrees
+     * with per-token" is not agreement between two things that could be wrong
+     * together -- one end of it is anchored.
+     *
+     * Several chunk sizes on purpose. Chunk 1 must land on the same code as
+     * decode. Chunks that do not divide the prompt length exercise the ragged
+     * last chunk, and chunk boundaries are exactly where a position-ordered
+     * bug in the sliding ring or the compressor would hide: get pos0 wrong and
+     * only the first chunk is right.
+     */
+    if (!fails) {
+        printf("\n-- batched prefill vs per-token, bit for bit --\n");
+        const int chunks[4] = { 1, 2, 3, toks->len };
+        float *hb = calloc((size_t)toks->len * hc * d, sizeof(float));
+        float *yb = calloc((size_t)d, sizeof(float));
+        float *lb = calloc((size_t)c.vocab, sizeof(float));
+        int32_t *tid_buf = calloc((size_t)toks->len, sizeof(int32_t));
+        DSV4Batch bat;
+
+        for (int ci = 0; ci < 4 && hb && yb && lb && tid_buf; ci++) {
+            const int nchunk = chunks[ci];
+            if (nchunk < 1 || nchunk > DSV4_MAX_BATCH) continue;
+            if (ci > 0 && nchunk == chunks[ci - 1]) continue;
+
+            if (dsv4_batch_init(&bat, &c, nchunk) != 0) {
+                CHECK(0, "batch_init failed at chunk %d", nchunk); break;
+            }
+            /* Fresh layer state: the sliding ring and the compressor carry
+             * position-ordered history, and reusing the per-token run's would
+             * make this compare two different sequences. */
+            for (int L = 0; L < c.n_layers; L++) {
+                dsv4_state_free(&ls[L]);
+                dsv4_state_init(&ls[L], &c, L, maxpos);
+            }
+
+            int bad = 0;
+            for (int p0 = 0; p0 < toks->len && !bad; p0 += nchunk) {
+                const int nt = (toks->len - p0 < nchunk) ? toks->len - p0
+                                                         : nchunk;
+                for (int t = 0; t < nt; t++) {
+                    tid_buf[t] = (int32_t)toks->kids[p0 + t]->num;
+                    dsv4_embed_row(yb, mb.w.embed, mb.w.wdt,
+                                   (int)tid_buf[t], d);
+                    for (int j = 0; j < hc; j++)
+                        memcpy(hb + (size_t)t * hc * d + (size_t)j * d, yb,
+                               (size_t)d * sizeof(float));
+                }
+
+                for (int L = 0; L < c.n_layers; L++) {
+                    DSV4LayerBind lb2;
+                    if (dsv4_trunk_bind(&tr, &c, L, &lb2) != 0) {
+                        CHECK(0, "trunk_bind failed on layer %d", L);
+                        bad = 1; break;
+                    }
+                    const int comp = dsv4_compress_ratio(&c, L) != 0;
+                    dsv4_layer_forward_n(hb, &lb2.w, &c, &s, &bat, &src, &ls[L],
+                                         comp ? cs_c : cs_d,
+                                         comp ? sn_c : sn_d,
+                                         p0, tid_buf, nt);
+                }
+                if (bad) break;
+
+                for (int t = 0; t < nt; t++) {
+                    hc_head(yb, hb + (size_t)t * hc * d, &mb.w.hc_head,
+                            hc, d, c.rms_eps, c.hc_eps);
+                    dsv4_rmsnorm(yb, yb, mb.w.norm, d, c.rms_eps);
+                    DSV4QMat head2 = { mb.w.head, NULL, DSV4_WBF16,
+                                       c.vocab, d, 0, 0 };
+                    dsv4_mmq(lb, yb, &head2);
+                    const float *ref = ref_logits + (size_t)(p0 + t) * c.vocab;
+                    if (memcmp(lb, ref, (size_t)c.vocab * sizeof(float)) != 0) {
+                        int at = 0;
+                        for (int v = 0; v < c.vocab; v++)
+                            if (lb[v] != ref[v]) { at = v; break; }
+                        CHECK(0, "chunk %d, pos %d: logit %d is %.17g batched "
+                                 "vs %.17g per-token", nchunk, p0 + t, at,
+                              (double)lb[at], (double)ref[at]);
+                        bad = 1; break;
+                    }
+                }
+            }
+            if (!bad)
+                printf("  ok    chunk %-3d: all %d positions bit-identical to "
+                       "the per-token path\n", nchunk, toks->len);
+            dsv4_batch_free(&bat);
+        }
+        free(hb); free(yb); free(lb); free(tid_buf);
+    }
+
 done:
     for (int L = 0; L < c.n_layers; L++) dsv4_state_free(&ls[L]);
-    free(ls); free(h); free(y); free(logits);
+    free(ls); free(h); free(y); free(logits); free(ref_logits);
     free(cs_d); free(sn_d); free(cs_c); free(sn_c);
     dsv4_scratch_free(&s); dsv4_bind_model_free(&mb);
     dsv4_cache_free(&cache); dsv4_trunk_close(&tr); dsv4_st_close(&st);

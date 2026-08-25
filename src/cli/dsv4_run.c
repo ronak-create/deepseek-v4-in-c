@@ -118,7 +118,7 @@ static void hc_head(float *y, const float *x, const DSV4HcW *w,
 static void usage(const char *me)
 {
     printf("usage: %s <model_dir | --model DIR> --trunk <dir> --tok <file> "
-           "[--prompt TEXT] [--gen N] [--budget GB] [--route-log FILE]\n"
+           "[--prompt TEXT] [--gen N] [--budget GB] [--batch N] [--route-log FILE]\n"
            "       [--gpu] [--chat] [--think] [--system TEXT]\n", me);
 }
 
@@ -129,6 +129,11 @@ int main(int argc, char **argv)
     int use_gpu = 0, chat = 0, think = 0;
     const char *sysprompt = NULL;
     const char *prompt = "The capital of France is";
+    /* Prompt tokens processed together. 32 because bench/gemm_bw.c has every
+     * shape's per-token cost flat by 16-32 and DSV4_MAX_BATCH is 64; --batch 1
+     * turns batching off entirely, which is what an A/B against the per-token
+     * prefill needs. */
+    int nbatch = 32;
     int ngen = 8;
     double budget_gb = 8.0;
 
@@ -145,6 +150,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--gen")   && i + 1 < argc) ngen    = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--budget")&& i + 1 < argc) budget_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--route-log") && i + 1 < argc) routelog = argv[++i];
+        else if (!strcmp(argv[i], "--batch") && i + 1 < argc) nbatch = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gpu")) use_gpu = 1;
         else if (!strcmp(argv[i], "--chat")) chat = 1;
         else if (!strcmp(argv[i], "--think")) { chat = 1; think = 1; }
@@ -346,6 +352,10 @@ int main(int argc, char **argv)
     printf("--- generated ids ---\n");
     const double t0 = now_s();
     int ntok = 0;
+    /* Time to first token, reported separately because it is a different
+     * question from the decode rate and it is the one that decides whether the
+     * engine is usable in an agent loop. */
+    double ttft = 0.0;
 
     /* PROMPT TOKENS GO THROUGH ONE AT A TIME, and that is not an oversight.
      *
@@ -365,7 +375,73 @@ int main(int argc, char **argv)
      * flop/byte to ~N -- which needs a batched variant of every matmul and of
      * attention. That is a different change, and layer-major is only its
      * scaffolding. See task notes. */
-    for (int pos = 0; pos < nprompt + ngen; pos++) {
+    /* ---- BATCHED PREFILL ----
+     *
+     * The prompt goes through in chunks of nbatch rather than one token at a
+     * time, so a layer's weights are loaded once and used for every token in
+     * the chunk, and a routed expert is read from disk once for the chunk
+     * instead of once per token that wanted it.
+     *
+     * Bit-identical to the per-token path, and the model oracle gates exactly
+     * that at several chunk sizes -- see tests/unit/test_model_oracle.c. The
+     * ordering rules that make it so live in dsv4_layer.c.
+     *
+     * Skipped for a 1-token prompt and for --batch 1, which then falls into the
+     * loop below and runs the decode path for every position. */
+    int pos_start = 0;
+    if (nbatch > 1 && nprompt > 1) {
+        if (nbatch > DSV4_MAX_BATCH) nbatch = DSV4_MAX_BATCH;
+        DSV4Batch bat;
+        if (dsv4_batch_init(&bat, &c, nbatch) != 0) return 1;
+
+        float *hb = calloc((size_t)nbatch * hc * d, sizeof(float));
+        int32_t *tb = calloc((size_t)nbatch, sizeof(int32_t));
+        if (!hb || !tb) { fprintf(stderr, "prefill: out of memory\n"); return 1; }
+
+        for (int p0 = 0; p0 < nprompt; p0 += nbatch) {
+            const int nt = (nprompt - p0 < nbatch) ? nprompt - p0 : nbatch;
+            for (int t = 0; t < nt; t++) {
+                tb[t] = ids[p0 + t];
+                dsv4_embed_row(xh, mb.w.embed, mb.w.wdt, tb[t], d);
+                for (int j = 0; j < hc; j++)
+                    memcpy(hb + (size_t)t * hc * d + (size_t)j * d, xh,
+                           (size_t)d * sizeof(float));
+            }
+            for (int L = 0; L < c.n_layers; L++) {
+                DSV4LayerBind lb;
+                if (dsv4_trunk_bind(&tr, &c, L, &lb) != 0) return 1;
+                const int comp = dsv4_compress_ratio(&c, L) != 0;
+                dsv4_layer_forward_n(hb, &lb.w, &c, &scratch, &bat, &src,
+                                     &lst[L], comp ? cs_c : cs_d,
+                                     comp ? sn_c : sn_d, p0, tb, nt);
+            }
+            /* Only the LAST prompt token's hidden state is ever read: the head
+             * runs once, on the token whose logits pick the first generated
+             * one. Every earlier prompt token exists to fill the KV cache. */
+            if (p0 + nt >= nprompt)
+                memcpy(h, hb + (size_t)(nt - 1) * hc * d,
+                       (size_t)hc * d * sizeof(float));
+        }
+        free(hb); free(tb);
+        dsv4_batch_free(&bat);
+
+        ttft = now_s() - t0;
+
+        hc_head(xh, h, &mb.w.hc_head, hc, d, c.rms_eps, c.hc_eps);
+        dsv4_rmsnorm(xh, xh, mb.w.norm, d, c.rms_eps);
+        DSV4QMat head0 = { mb.w.head, NULL, DSV4_WBF16, c.vocab, d, 0, 0 };
+        dsv4_mmq(logits, xh, &head0);
+        int best0 = 0;
+        for (int v = 1; v < c.vocab; v++) if (logits[v] > logits[best0]) best0 = v;
+        if (nprompt < nprompt + ngen) ids[nprompt] = best0;
+        printf(" %d", best0);
+        fflush(stdout);
+        ntok++;
+        if (eos_id >= 0 && best0 == eos_id) { printf("  <eos>"); goto generated; }
+        pos_start = nprompt;
+    }
+
+    for (int pos = pos_start; pos < nprompt + ngen; pos++) {
         const int32_t tid = (pos < nprompt) ? ids[pos] : ids[pos];
 
         /* embed, then expand to hc_mult identical copies (model.py Transformer:
@@ -383,6 +459,11 @@ int main(int argc, char **argv)
         }
 
         if (pos + 1 >= nprompt) {
+            /* Stamped at the same instant the batched path stamps it: the last
+             * prompt token has cleared every layer and the head has not run
+             * yet. Without this the two paths report different things and the
+             * A/B is not an A/B. */
+            if (ttft == 0.0 && pos + 1 == nprompt) ttft = now_s() - t0;
             hc_head(xh, h, &mb.w.hc_head, hc, d, c.rms_eps, c.hc_eps);
             dsv4_rmsnorm(xh, xh, mb.w.norm, d, c.rms_eps);
             DSV4QMat head = { mb.w.head, NULL, DSV4_WBF16, c.vocab, d, 0, 0 };
@@ -400,10 +481,15 @@ int main(int argc, char **argv)
             if (eos_id >= 0 && best == eos_id) { printf("  <eos>"); break; }
         }
     }
+generated:
+    ;
     const double dt = now_s() - t0;
 
     printf("\n\n%d tokens in %.1f s, %.2f s/token\n", ntok, dt,
            ntok ? dt / ntok : 0.0);
+    printf("time to first token: %.1f s over %d prompt tokens "
+           "(%.2f s/prompt token, --batch %d)\n",
+           ttft, nprompt, ttft / nprompt, nbatch);
     dsv4_trunk_report(&tr, "run");
     dsv4_cache_report(&cache, "run");
     dsv4_prof_report(dt, ntok);
