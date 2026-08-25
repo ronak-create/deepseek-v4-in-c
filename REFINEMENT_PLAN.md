@@ -322,25 +322,44 @@ per-token inside the batch — 46% of batched TTFT, and the only remaining 2x.
 
 ## Tier 3 — research, only after Tier 2, and only if measured first
 
-### 10. Speculative cross-token expert prediction
+### 10. Speculative cross-token expert prediction — MEASURED, and it is DEAD
 **From:** `Genericinquirer` (twice, including "train a small model for it"),
 corroborated by colibri's 71.6% one-layer-ahead claim.
 
-The objection raised in-thread is real and stands: DeepSeek's training spreads
-load across experts on purpose, and a wrong guess both wastes a read and can
-evict something useful. Both halves are testable **without touching the engine**,
-using the route logs and `tools/sim_cache.py` that already exist:
+**Tested with `tools/predict_route.py` on a real 65-token route log, no engine
+change, exactly as this section proposed. It cannot help.**
 
-1. From a stored `--route-log`, measure P(expert set at L+1 | expert set at L)
-   and P(same expert at L on token t+1 | token t). If it is nowhere near 71.6%
-   on this model, stop — that is a publishable negative result and it costs a
-   day.
-2. If it is high, prefetch into **dedicated non-evicting slots**, so a wrong
-   guess can never displace a live entry. That removes the second objection
-   entirely and reduces the downside to wasted bandwidth.
+The previous token's route predicts **36.2%** of the next token's expert
+requests (44.7% from the last two tokens, 52.6% from the last four). That part
+of colibri's premise holds — routing does repeat.
 
-A trained predictor is out of scope. A frequency/recency table replayed through
-`sim_cache.py` is the cheap version and answers the same question.
+It buys nothing anyway, and the trace shows why with an exact identity:
+
+    slots   hits            predictable misses
+      240   0      ( 0.0%)  5978  (35.6%)
+      281   5978  (35.6%)   0     ( 0.0%)
+
+One forward pass touches 43 x 6 = **258 experts**. Below that, LRU holds nothing
+and every prediction is useful but unaffordable. Above it, **every expert the
+previous token used is still resident when the next token asks for it** — so
+the 5978 predictable requests are *precisely* the 5978 cache hits. Prefetching
+them re-fetches what the cache already has.
+
+There is no budget where this wins. Below 258 slots the prefetched entry is
+evicted before use; above it LRU already captured everything the predictor
+knows. The misses that remain at `--budget 16` (41.6% of requests) are experts
+that appear in *none* of the last four tokens — genuinely novel routing, which
+no history-based predictor can reach by construction.
+
+**Consequence for the declined item:** training a predictor from scratch was
+already declined on cost. It is now declined on a stronger ground — a
+history-based predictor has no headroom to recover, so a learned one would have
+to beat the router by modelling the hidden state, not by learning usage
+patterns. That is a research project, not an optimisation.
+
+This also confirms the objection raised in-thread: DeepSeek balances expert load
+across the vocabulary on purpose, and what repetition survives is already the
+thing LRU is good at.
 
 ### 11. Per-prompt expert pruning (opt-in, explicitly non-exact)
 **From:** `MatiAI` — pointed at Apple's on-device MoE and Instruction-Following
