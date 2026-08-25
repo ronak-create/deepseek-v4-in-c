@@ -480,7 +480,40 @@ static void *reader_main(void *arg)
  * refuses to run. */
 static void reader_pool_start(DSV4Cache *c)
 {
+    /* HOW WIDE SHOULD THE POOL BE? topk. THE PLAUSIBLE ARGUMENT FOR LESS IS
+     * WRONG, AND IT WAS MEASURED RATHER THAN ARGUED.
+     *
+     * The argument: bench/cache_bw.c's queue-depth sweep says this drive
+     * plateaus by QD2-4 and is flat to 32, so readers past the plateau return
+     * no bandwidth -- while the A/B that landed the overlap measured the expert
+     * matmul 34% SLOWER during streaming, DMA contending with a memory-bound
+     * FP4 kernel. So a narrower pool should buy back matmul time for free.
+     *
+     * It does not. Five interleaved rounds on the real checkpoint,
+     * --gen 15 --budget 16 --gpu, varying DSV4_READERS:
+     *
+     *   readers            1      2      3      4      6
+     *   exposed I/O ms   667.9  488.5  418.3  375.4  351.3
+     *   s/token           1.72   1.54   1.40   1.39   1.39
+     *
+     * Widest wins, and nothing is bought back below it.
+     *
+     * The sweep is not wrong; it answers a different question. It measures
+     * THROUGHPUT over 48 reads. What end() waits for is the MAKESPAN of one
+     * batch of at most six, against a fixed amount of hit-matmul to hide it
+     * behind. Halve the readers and a six-miss batch takes three serial rounds
+     * instead of one; the drive is no busier, but the caller waits longer. A
+     * queue-depth curve cannot see that, because it never has a deadline.
+     *
+     * DSV4_READERS stays as the knob that produced the table, and for drives
+     * whose curve is not this one. */
     int want = DSV4_MAX_TOPK;
+    const char *env = getenv("DSV4_READERS");
+    if (env) {
+        const int n = atoi(env);
+        if (n > 0) want = n;
+    }
+    if (want > DSV4_MAX_TOPK) want = DSV4_MAX_TOPK;
     if (want > c->nbounce) want = c->nbounce;
     if (want < 1) return;
 

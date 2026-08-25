@@ -88,7 +88,8 @@ static int collect_regions(const DSV4St *st, const DSV4Cfg *cfg,
     return n;
 }
 
-static int sweep(const DSV4St *st, const DSV4Cfg *cfg, int per_point)
+static int sweep(const DSV4St *st, const DSV4Cfg *cfg, int per_point,
+                 int shuffle)
 {
     static const int QD[] = { 1, 2, 3, 4, 6, 8, 12, 16, 24, 32 };
     const int NQD = (int)(sizeof QD / sizeof QD[0]);
@@ -104,6 +105,29 @@ static int sweep(const DSV4St *st, const DSV4Cfg *cfg, int per_point)
     Region *reg = (Region *)malloc((size_t)cap * sizeof *reg);
     if (!reg) return 1;
     const int nreg = collect_regions(st, cfg, reg, cap);
+
+    /* SHUFFLE, AND THIS IS NOT COSMETIC.
+     *
+     * collect_regions walks layer-major, so consecutive regions sit near each
+     * other on disk. Read in that order the sweep plateaus at QD2 -- and it
+     * then says something true about a workload this engine does not have.
+     * Real routing picks 6 of 256 experts per layer by content, so the reads
+     * are scattered, and scattered reads have per-request latency that only
+     * more requests in flight can hide.
+     *
+     * That difference is measurable in the engine: at DSV4_READERS=2 a live
+     * run spends 488 ms/pass in exposed I/O against 369 at 4-6. So the
+     * ordered sweep understates what depth is worth. Shuffled is the default
+     * because it is the honest model of the workload; pass `ordered` as the
+     * third argument to get the near-contiguous curve back for comparison. */
+    if (shuffle) {
+        unsigned rs = 20260825u;
+        for (int i = nreg - 1; i > 0; i--) {
+            rs = rs * 1103515245u + 12345u;
+            const int j = (int)((rs >> 16) % (unsigned)(i + 1));
+            const Region tmp = reg[i]; reg[i] = reg[j]; reg[j] = tmp;
+        }
+    }
     if (nreg < NQD * per_point) {
         printf("  only %d expert regions found; need %d. Lower "
                "reads-per-point and rerun.\n", nreg, NQD * per_point);
@@ -127,8 +151,10 @@ static int sweep(const DSV4St *st, const DSV4Cfg *cfg, int per_point)
         }
 
     printf("\nqueue-depth sweep: %d reads of %.2f MB per point, O_DIRECT,\n"
-           "distinct regions throughout (%d available)\n\n",
-           per_point, (double)expert_bytes / 1048576.0, nreg);
+           "%s order, distinct regions throughout (%d available)\n\n",
+           per_point, (double)expert_bytes / 1048576.0,
+           shuffle ? "SHUFFLED (as routing reads them)" : "layer-major",
+           nreg);
     printf("  %3s %10s %10s %12s %10s\n",
            "QD", "GB/s", "ms/read", "MB in", "vs QD1");
 
@@ -177,7 +203,7 @@ int main(int argc, char **argv)
     const char *m = argc > 1 ? argv[1] : getenv("DSV4_MODEL");
     if (!m) {
         printf("usage: cache_bw <model_dir> [reps] [experts]\n");
-        printf("       cache_bw <model_dir> qd [reads-per-point]\n");
+        printf("       cache_bw <model_dir> qd [reads-per-point] [ordered]\n");
         return 2;
     }
 
@@ -194,7 +220,9 @@ int main(int argc, char **argv)
          * through the same O_DIRECT entry point the cache uses, and
          * building a cache only to read one field would emit two
          * warnings about a budget the sweep never uses. */
-        const int rc = sweep(&st, &c, argc > 3 ? atoi(argv[3]) : 48);
+        const int per = argc > 3 ? atoi(argv[3]) : 48;
+        const int shuf = !(argc > 4 && !strcmp(argv[4], "ordered"));
+        const int rc = sweep(&st, &c, per, shuf);
         dsv4_st_close(&st);
         return rc;
     }

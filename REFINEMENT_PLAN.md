@@ -152,6 +152,22 @@ contending with a memory-bound FP4 matmul. That is the same mechanism the README
 names as the unmeasured suspect behind the GPU contention collapse, now observed
 with no GPU in the picture.
 
+**A narrower reader pool does not buy the contention back**, though the
+argument that it should is a good one. Five interleaved rounds varying
+`DSV4_READERS`: exposed I/O 667.9 / 488.5 / 418.3 / 375.4 / 351.3 ms/pass at
+1 / 2 / 3 / 4 / 6 readers, and s/token 1.72 / 1.54 / 1.40 / 1.39 / 1.39.
+Widest wins. The QD sweep measures *throughput* over 48 reads; what `end()`
+waits for is the *makespan* of a batch of six against a fixed amount of
+hit-matmul. Halving the readers triples the rounds without making the drive
+busier. Recorded so the argument is not made again from scratch.
+
+That same experiment sent me back to item 8's sweep, which collected regions
+layer-major — near-contiguous, unlike the scattered reads real routing issues.
+The sweep now shuffles by default. **The negative result survives**: shuffled
+peaks at QD4 rather than QD2 and is equally flat to 32, so io_uring still buys
+nothing. The ordered curve alone would have overstated how little depth is
+worth, and `ordered` reproduces it for comparison.
+
 **And it does nothing at `--budget 4`**, where the hit rate is exactly 0% so
 there are no residents to compute during the reads. Measured, identical both
 ways. The payoff is proportional to the hit rate — which is the argument for

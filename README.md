@@ -589,6 +589,30 @@ machine's warming cannot favour either:
 of the spread. Decoupling the wall clock from the drive's variance is what makes
 the run predictable.
 
+### A narrower reader pool does not buy back the contention
+
+If DMA is what costs the matmul 34%, and
+[the drive plateaus by QD2–4](#is-the-read-path-queue-depth-bound-no-and-that-closes-a-whole-roadmap-item),
+then readers past the plateau spend DRAM bandwidth and return none — so a
+narrower pool should be free money. It is not. Five interleaved rounds,
+`--gen 15 --budget 16 --gpu`, varying `DSV4_READERS`:
+
+| readers | 1 | 2 | 3 | 4 | **6 (default)** |
+|---|---|---|---|---|---|
+| exposed I/O, ms/pass | 667.9 | 488.5 | 418.3 | 375.4 | **351.3** |
+| s/token | 1.72 | 1.54 | 1.40 | 1.39 | **1.39** |
+
+Widest wins and nothing is recovered below it. The sweep is not wrong — it
+answers a different question. It measures **throughput** over 48 reads, while
+what `end()` waits for is the **makespan** of one batch of at most six, against
+a fixed amount of hit-matmul to hide it behind. Halve the readers and a six-miss
+batch takes three serial rounds instead of one: the drive is no busier, the
+caller waits longer. A queue-depth curve cannot see that, because it never has
+a deadline.
+
+Recorded because the argument for the narrower pool is a good one, and someone
+will make it again.
+
 ### Where it does nothing, and why that was predictable
 
 At `--budget 4` the expert cache hit rate is **exactly 0%**: the budget is below
@@ -729,9 +753,17 @@ concurrency 1 to 32. Three consecutive runs, agreeing to within 2%:
 
 | QD | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 | 24 | 32 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| GB/s | 3.95 | **4.98** | 4.56 | 4.66 | 4.97 | 4.81 | 4.94 | 4.70 | 4.61 | 4.77 |
+| GB/s, layer-major | 3.95 | **4.98** | 4.56 | 4.66 | 4.97 | 4.81 | 4.94 | 4.70 | 4.61 | 4.77 |
+| GB/s, shuffled | 4.03 | 5.11 | 5.15 | **5.24** | 5.21 | 5.18 | 4.94 | 5.03 | 4.99 | 4.99 |
 
-**Concurrency is worth about 25%, all of it arrives by QD2, and the curve is
+The sweep shuffles by default, and that is not cosmetic: regions are collected
+layer-major, so read in that order they sit near each other on disk, and the
+curve knees one point earlier than the scattered reads real routing actually
+issues. Both orders reach the same plateau and both are flat to 32 — which is
+the conclusion — but the ordered curve alone would have overstated how little
+depth is worth. Pass `ordered` as a third argument to reproduce it.
+
+**Concurrency is worth about 25%, all of it arrives by QD2–4, and the curve is
 flat from there to 32.** So:
 
 - `io_uring` buys nothing on this drive. Six OpenMP `pread`s already sit well
