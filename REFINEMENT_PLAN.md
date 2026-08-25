@@ -174,7 +174,7 @@ ways. The payoff is proportional to the hit rate — which is the argument for
 item 7, since exact hash-layer prefetch manufactures overlappable work on
 precisely the configurations that have none.
 
-### 7. Exact prefetch for the hash layers
+### 7. Exact prefetch for the hash layers — SIZED, NOT BUILT
 **From:** the `tid2eid` exception this repo already documents but never uses.
 
 Layers 0–2 route by static token-id lookup. The moment a token is sampled, the
@@ -188,6 +188,42 @@ it is the cheapest possible test of the async machinery item 6 builds.
 
 *Verify:* hit rate on layers 0–2 should reach ~100% after the first token; tokens
 must be identical; A/B the wall clock and expect low single digits.
+
+**Sized 2026-08-25 from a real route log, and the sizing above was too
+pessimistic for an interesting reason.** Replaying a `--budget 16 --gpu` trace
+through an LRU of the engine's own 767 slots reproduces its 49.9% hit rate
+exactly, and then splits it:
+
+| | requests | hits | hit rate | misses |
+|---|---|---|---|---|
+| hash layers 0–2 | 360 | 60 | **16.7%** | 300 |
+| scored layers 3–42 | 4,800 | 2,517 | 52.4% | 2,283 |
+
+**The hash layers have three times the miss rate of the scored ones.** `tid2eid`
+routing is a function of the token id, so it spreads across the vocabulary and
+has far less reuse than content-based routing, which concentrates. So they are
+7% of requests but **11.6% of all misses** — the plan's "~7% of expert traffic,
+small" understated it.
+
+Ceiling: removing 300 of 2,583 misses is 11.6% of expert I/O, which at 33% of
+wall clock is **~3.9% of the wall clock**, and only if the moved reads land in
+idle drive time (there is plenty: the drive is busy a third of the run).
+
+Two versions, and they are not the same job:
+
+- **Layer 0 only** — issue its `begin()` at sampling time, before the embedding
+  and layer 0's attention, and let its MoE call `end()`. One batch, no new
+  machinery, no reserved slots, and eviction between issue and use is
+  impossible because nothing else runs in between. Worth ~1.3%.
+- **All three layers** — needs more than one batch in flight in the reader pool,
+  and at low budget it needs non-evicting reserved slots, because at
+  `--budget 4` the LRU evicts everything before its layer comes round. Worth
+  the full ~3.9%, at maybe a day.
+
+**~3.9% is below what this machine can resolve** without a large number of
+interleaved runs — identical builds swing ±20% with thermal and disk state. So
+this is a decision, not an obvious next step: the work is well understood and
+the payoff is real but small.
 
 ### 8. Find out whether the read path is actually queue-depth-bound — DONE, NEGATIVE
 **From:** `ProfessionalJackals` — "buy a ton of NVMes and parallel read".
