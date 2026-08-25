@@ -39,10 +39,15 @@
  *       long run plus a bounded logit delta -- never on bit equality.
  *     - No GPU result may ever regenerate a fixture.
  *
- *   Accumulation is in double on the device for the same reason the CPU does it:
- *   these are bandwidth-bound kernels, so the arithmetic precision is close to
- *   free, and it keeps the delta against the reference small enough that a real
- *   divergence stands out from rounding.
+ *   Accumulation is SPLIT: float inside one 128-column scale block, double for
+ *   the scale multiply and every sum above it. This used to be double all the
+ *   way down, justified here by "bandwidth-bound, so precision is close to
+ *   free". That justification was never measured and it was wrong -- the double
+ *   kernel was FP64-throughput-bound, and dropping the inner loop to float is
+ *   3.3x on identical memory traffic. Keeping the fold in double costs 2.5% of
+ *   that and keeps the delta against the CPU reference flat in the reduce
+ *   dimension, so a real divergence still stands out from rounding. The numbers
+ *   are in the kernel comment in src/cuda/dsv4_cuda.cu.
  */
 #ifndef DSV4_CUDA_H
 #define DSV4_CUDA_H

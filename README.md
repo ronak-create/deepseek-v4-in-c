@@ -149,11 +149,14 @@ correctness. Measured on Flash, same prompt:
 | 16 GB | 18.08 GB | 2.14 – 2.21 | 43 / 43 |
 | 16 GB + `--gpu` | 18.19 GB | **1.62 – 1.74** | 43 / 43 |
 
-Ranges are two runs of the same command; single figures are one run. These were
-measured before [the expert cache stopped copying](#the-expert-cache-reads-straight-into-its-slots),
-which is worth about 12% and is not yet reflected here — the machine has to go
-cold again first, and mixing a warm number into a cold table is exactly the
-mistake this page already made once. These are
+Ranges are two runs of the same command; single figures are one run. **This
+table is stale in the conservative direction and deliberately not patched.** It
+was measured before two changes that both help and neither of which is in it:
+[the expert cache stopped copying](#the-expert-cache-reads-straight-into-its-slots),
+worth about 12%, and [the FP64 fix](#fp64-was-the-kernels-real-cost-and-the-reason-given-for-it-was-wrong),
+worth about 12% more on the `--gpu` row. The machine has to go cold again before
+either can be folded in, and mixing a warm number into a cold table is exactly
+the mistake this page already made once. These are
 short runs, so the fixed cost of filling a cold cache is spread over 26 tokens
 — treat the small-budget rows as an upper bound on what a small machine pays.
 
@@ -443,16 +446,78 @@ re-read from RAM every layer, so they are bandwidth-bound rather than
 conversion-bound. That is the measurement that argues for putting the trunk in
 VRAM instead of optimising it further on the CPU.
 
-Per-call, including the PCIe round trip:
+### The per-call cost, and a claim that did not survive being measured
 
-| | GPU | CPU (AVX2) |
+This section used to say: *"there is a ~1.3 ms floor per call that barely varies
+with size"*, from two matrices — `wo_b` 4096x8192 and `wq_b` 32768x1024. Those
+are **both 33.5 MB**. Two points at one size cannot tell a fixed overhead apart
+from a cost linear in bytes; they agreed because they were the same measurement
+twice.
+
+`bench/gpu_call.c` sweeps ten shapes over four orders of magnitude and fits the
+two terms separately (RTX 5060 Laptop, weights resident, best of 200):
+
+| shape | MB | GPU ms | CPU ms | GB/s |
+|---|---|---|---|---|
+| 512x512 | 0.2 | 0.059 | 7.001 † | 4.4 |
+| 1024x1024 | 1.0 | 0.065 | 0.101 | 16.1 |
+| 4096x1024 | 4.0 | 0.107 | 0.408 | 39.2 |
+| 2048x4096 | 8.0 | 0.159 | 0.808 | 52.9 |
+| 4096x4096 | 16.0 | 0.257 | 1.596 | 65.3 |
+| fp8 wo_b 4096x8192 | 32.0 | **0.432** | 4.344 | 77.6 |
+| fp8 wq_b 32768x1024 | 32.0 | **0.464** | 3.233 | 72.3 |
+| 8192x8192 | 64.0 | 0.991 | 6.495 | 67.7 |
+| 4096x16384 (Pro width) | 64.0 | 1.060 | 6.681 | 63.3 |
+
+    ms = 0.0308 + 0.01504 * MB
+    fixed per-call cost : 31 us
+    marginal bandwidth  : 69.7 GB/s
+
+**The floor is 31 µs, not 1.3 ms** — 40x smaller than the old claim, and the
+call is bandwidth-bound essentially all the way down. The old figure was the
+double-accumulation kernel's *run time on a 33.5 MB matrix* being read as
+overhead. `wo_b` is now 0.432 ms rather than 1.348: most of that gap is the FP64
+fix below, the rest is that 1.348 was a single warm sample.
+
+† The CPU column below ~1 MB is not a matmul time. At 512x512 it is 5.3 ms with
+the default 20 OpenMP threads and 0.41 ms with `OMP_NUM_THREADS=1` — 13x slower
+for having *more* threads, repeatably and after a warm-up call. That is
+fork-join overhead in a process holding a live CUDA context and pinned host
+memory. The cause is **not measured**; it is related to, but not explained by,
+the contention documented below. The fit uses only the GPU column.
+
+## FP64 was the kernel's real cost, and the reason given for it was wrong
+
+`dsv4_cuda.h` justified accumulating in `double` with "these are bandwidth-bound
+kernels, so the arithmetic precision is close to free". That was never measured
+and it is false: consumer Blackwell runs FP64 at a fraction of FP32, so the
+kernel was FP64-throughput-bound, not DRAM-bound. On identical memory traffic:
+
+| accumulation | 4096x8192 | 4096x16384 | 129280x4096 | worst rel. vs double |
+|---|---|---|---|---|
+| `double` (was shipped) | 1.271 ms | 2.538 ms | 19.99 ms | — |
+| `float` throughout | 0.373 ms | 1.015 ms | 7.365 ms | 4.3e-7 → 8.2e-7 |
+| **float inner, double fold** | **0.382 ms** | **1.040 ms** | **7.523 ms** | 2.8e-7 → 4.3e-7 |
+
+Shipped is the third row: the dot product over one 128-column scale block runs
+in `float`; the scale multiply, the fold across blocks and the cross-warp sum
+stay in `double`. It costs 2.5% against pure `float` and buys back the property
+that matters — pure `float`'s error grows with the reduce dimension, because the
+cross-block sum gets longer, while the hybrid's does not. Pro's reduce dimension
+is 16384, so that is not academic.
+
+Interleaved A/B on the real checkpoint, `--gen 15 --budget 16 --gpu`, three
+pairs alternated on a warming machine, **identical token ids in all six runs**:
+
+| | double | hybrid |
 |---|---|---|
-| fp8 wo_b 4096x8192 | **1.348 ms** | 3.401 ms |
-| fp8 wq_b 32768x1024 | **1.341 ms** | 3.522 ms |
+| attention, ms/pass | 502.5 / 421.8 / 445.1 | **350.0 / 288.5 / 288.9** |
+| shared expert, ms/pass | 88.9 / 92.4 / 103.3 | **81.1 / 71.3 / 62.7** |
+| wall clock, s/token | 1.53 / 1.29 / 1.40 | **1.37 / 1.16 / 1.15** |
 
-There is a ~1.3 ms floor per call that barely varies with size, so the GPU wins
-on the 33.5 MB matrices and loses on small ones — `wkv` is 4.2 MFLOP, which the
-CPU finishes in 0.23 ms.
+Attention — the component that is actually on the device — falls about 30%.
+Wall clock falls about 12%; the disk fraction cannot move and it swings more
+than that from run to run, which is why the components are the number to trust.
 
 ## The GPU needs a spare core
 

@@ -68,6 +68,27 @@ __device__ __forceinline__ float d_e8m0(unsigned char b)
  * element -- matching inference/kernel.py's fp4_gemm and the CPU path. Scaling
  * each weight would be algebraically equal, numerically different, and cost a
  * multiply per element instead of per block.
+ *
+ * ACCUMULATION IS SPLIT, AND THE SPLIT IS MEASURED, NOT ASSUMED.
+ * The inner product over one 128-column scale block runs in float; the scale
+ * multiply, the fold across blocks and the final cross-warp sum run in double.
+ *
+ * This kernel used to be double throughout, justified by "bandwidth-bound, so
+ * precision is close to free". That was never measured and it is false --
+ * consumer Blackwell runs FP64 at a small fraction of FP32, and the shipped
+ * kernel was FP64-throughput-bound, not DRAM-bound. On identical memory
+ * traffic (RTX 5060 Laptop, 50 iterations, warm):
+ *
+ *     shape          double      float       hybrid    worst rel vs double
+ *     4096x8192      1.271 ms    0.373 ms    0.382 ms  float 4.3e-7  hyb 2.8e-7
+ *     4096x16384     2.538 ms    1.015 ms    1.040 ms  float 6.4e-7  hyb 2.8e-7
+ *     129280x4096   19.99  ms    7.365 ms    7.523 ms  float 8.2e-7  hyb 4.3e-7
+ *
+ * Hybrid costs 2-2.5% over pure float and buys back the property that matters:
+ * float's error grows with the reduce dimension because the cross-block sum
+ * gets longer, while the hybrid's does not -- only the fixed 128-element inner
+ * sum is narrow. Pro's reduce dimension is 16384, so that is not academic.
+ * Argmax was identical to the double kernel in every row of that table.
  */
 __global__ void k_mmq_fp8(float *__restrict__ y,
                           const float *__restrict__ x,
@@ -85,14 +106,14 @@ __global__ void k_mmq_fp8(float *__restrict__ y,
     double mine = 0.0;
     for (int c0 = warp * blk_c; c0 < in; c0 += nwarp * blk_c) {
         const int n = min(blk_c, in - c0);
-        double acc = 0.0;
+        float acc = 0.0f;
         for (int k = lane; k < n; k += 32)
-            acc = fma((double)d_e4m3(row[c0 + k]), (double)x[c0 + k], acc);
+            acc = fmaf(d_e4m3(row[c0 + k]), x[c0 + k], acc);
         /* Reduce the warp's 32 partials. */
         for (int off = 16; off > 0; off >>= 1)
             acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
         if (lane == 0)
-            mine += acc * (double)d_e8m0(S[(size_t)(o / blk_r) * sc
+            mine += (double)acc * (double)d_e8m0(S[(size_t)(o / blk_r) * sc
                                            + (c0 / blk_c)]);
     }
 

@@ -120,8 +120,14 @@ int main(void)
             if ((b & 0x7Fu) == 0x7Fu) b &= 0xFEu;
             W[i] = b;
         }
-        for (size_t i = 0; i < (size_t)((out + blk_r - 1) / blk_r) * sc; i++)
-            S[i] = 127;
+        /* Scales must VARY. A constant 127 is exactly 1.0, so the whole
+         * per-block scale multiply cancels and the gate cannot see a
+         * kernel that gets the scale path wrong -- or one whose scale
+         * arithmetic is too narrow. Spread them over 2^-7..2^7. */
+        for (size_t i = 0; i < (size_t)((out + blk_r - 1) / blk_r) * sc; i++) {
+            r = r * 1103515245u + 12345u;
+            S[i] = (uint8_t)(120u + ((r >> 16) % 15u));
+        }
 
         DSV4QMat m;
         memset(&m, 0, sizeof m);
